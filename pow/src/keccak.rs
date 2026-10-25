@@ -44,46 +44,62 @@ fn f1600(state: &mut State1600) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    #[test]
-    fn test_pow_keccak() {
-        use crate::{convenience::*, PoWGrinder};
+    use crate::{convenience::*, PoWGrinder};
 
-        const BITS: u32 = 10;
-
-        // Test with a fixed challenge
-        let challenge = [42u8; 32];
-
-        // Generate a proof-of-work solution
-        let solution =
-            grind_pow(KeccakPoW::new(challenge, BITS)).expect("Should find a valid solution");
-
-        // Grinding is deterministic: it returns the minimal satisfying nonce, so
-        // re-grinding the same challenge must yield the very same solution.
-        let mut grinder = PoWGrinder::new(KeccakPoW::new(challenge, BITS));
-        let solution2 = grinder.grind().expect("Should find a valid solution");
-        assert_eq!(solution, solution2);
-
-        // And the nonce must verify against the original challenge.
-        assert!(verify_pow(KeccakPoW::new(challenge, BITS), solution));
+    fn reference_word(seed: [u8; 32], nonce: u64) -> u64 {
+        let mut state = [0u64; 25];
+        for (word, bytes) in state.iter_mut().zip(seed.chunks_exact(8)) {
+            *word = u64::from_le_bytes(bytes.try_into().unwrap());
+        }
+        state[4] = nonce;
+        Keccak::new().with_f1600(|permute| permute(&mut state));
+        state[0]
     }
 
-    /// Difficulties at or above 60 bits are out of the supported range.
+    #[test]
+    fn predicate_matches_raw_permutation_and_inclusive_threshold() {
+        // Keccak-f[1600] zero-state known answer, independent of the grinder.
+        assert_eq!(reference_word([0; 32], 0), 0xf125_8f79_40e1_dde7);
+        for seed in [[0; 32], [42; 32]] {
+            let mut pow = KeccakPoW::new(seed, 0);
+            for nonce in [0, 1, u64::MAX] {
+                let word = reference_word(seed, nonce);
+                pow.threshold = word;
+                assert!(pow.check(nonce));
+                assert_eq!(pow.state[0], word);
+                assert!(word > 0);
+                pow.threshold = word - 1;
+                assert!(!pow.check(nonce));
+            }
+        }
+    }
+
+    #[test]
+    fn grinders_return_the_reference_minimum() {
+        for bits in [0, 8, 10] {
+            let seed = [42; 32];
+            let threshold = u64::MAX >> bits;
+            let expected = (0..=u64::MAX)
+                .find(|&nonce| reference_word(seed, nonce) <= threshold)
+                .unwrap();
+            let mut grinder = PoWGrinder::new(KeccakPoW::new(seed, bits));
+            assert_eq!(grinder.grind(), Some(expected));
+            assert_eq!(grind_pow(KeccakPoW::new(seed, bits)), Some(expected));
+            assert!(verify_pow(KeccakPoW::new(seed, bits), expected));
+            #[cfg(feature = "parallel")]
+            for workers in [1, 3, 4] {
+                let pool = rayon::ThreadPoolBuilder::new()
+                    .num_threads(workers)
+                    .build()
+                    .unwrap();
+                assert_eq!(pool.install(|| grinder.grind_parallel()), Some(expected));
+            }
+        }
+    }
+
     #[test]
     #[should_panic(expected = "bits must be smaller than 60")]
-    fn test_keccak_rejects_excessive_bits() {
-        let _ = KeccakPoW::new([0u8; 32], 60);
-    }
-
-    /// A difficulty inside the supported range still grinds and verifies.
-    #[test]
-    fn test_keccak_valid_difficulty_round_trip() {
-        use crate::convenience::*;
-
-        let challenge = [7u8; 32];
-        for bits in [0, 1, 8, 12] {
-            let solution =
-                grind_pow(KeccakPoW::new(challenge, bits)).expect("Should find a valid solution");
-            assert!(verify_pow(KeccakPoW::new(challenge, bits), solution));
-        }
+    fn rejects_unsupported_difficulty() {
+        let _ = KeccakPoW::new([0; 32], 60);
     }
 }

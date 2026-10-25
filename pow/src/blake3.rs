@@ -181,181 +181,104 @@ mod tests {
     use super::*;
     use crate::{convenience::*, PoWGrinder};
 
-    fn sample_challenges() -> Vec<[u8; 32]> {
-        vec![
-            [0u8; 32],                                              // All zeroes
-            [0xFF; 32],                                             // All ones
-            [42u8; 32],                                             // Constant value
-            (0..32).collect::<Vec<u8>>().try_into().unwrap(),       // Increasing
-            (0..32).rev().collect::<Vec<u8>>().try_into().unwrap(), // Decreasing
-        ]
+    fn reference_hash(seed: [u8; 32], nonce: u64) -> [u8; OUT_LEN] {
+        let mut input = [0; BLOCK_LEN];
+        input[..32].copy_from_slice(&seed);
+        input[32..40].copy_from_slice(&nonce.to_le_bytes());
+        *blake3::hash(&input).as_bytes()
+    }
+
+    fn reference_word(seed: [u8; 32], nonce: u64) -> u64 {
+        u64::from_le_bytes(reference_hash(seed, nonce)[..8].try_into().unwrap())
     }
 
     #[test]
-    fn test_pow_blake3() {
-        const BITS: u32 = 10;
-
-        for challenge in sample_challenges() {
-            // Generate a proof-of-work solution
-            let _solution =
-                grind_pow(Blake3PoW::new(challenge, BITS)).expect("Should find a valid solution");
-
-            // Verify we can generate solutions consistently
-            assert!(grind_pow(Blake3PoW::new(challenge, BITS)).is_some());
-        }
-
-        // Test using the PoWGrinder directly
-        let challenge = [42u8; 32];
-        let mut grinder = PoWGrinder::new(Blake3PoW::new(challenge, BITS));
-        let _solution = grinder.grind().expect("Should find a valid solution");
-    }
-
-    #[test]
-    fn test_new_pow_valid_bits() {
-        for bits in [0, 10, 20, 40, 59] {
-            let challenge = [1u8; 32];
-            let pow = Blake3PoW::new(challenge, bits);
-            let expected_threshold = u64::MAX >> bits;
-            assert_eq!(pow.threshold, expected_threshold);
-            assert_eq!(pow.challenge, challenge);
-        }
-    }
-
-    #[test]
-    #[should_panic]
-    fn test_new_invalid_bits() {
-        let _ = Blake3PoW::new([0u8; 32], 60);
-    }
-
-    #[test]
-    fn test_check_function_basic() {
-        let challenge = [0u8; 32];
-        let mut pow = Blake3PoW::new(challenge, 8);
-        for nonce in (0u64..10000).step_by(MAX_SIMD_DEGREE) {
-            if let Some(solution) = pow.check_many(nonce) {
-                assert!(pow.check(solution), "check() should match check_many()");
-                return;
+    fn simd_matches_independent_hashes_including_partial_tail() {
+        for seed in [[0; 32], [42; 32]] {
+            for base in [
+                0,
+                127,
+                u64::MAX - MAX_SIMD_DEGREE as u64 + 1,
+                u64::MAX - 1,
+                u64::MAX,
+            ] {
+                let mut pow = Blake3PoW::new(seed, 0);
+                for threshold in [
+                    0,
+                    u64::MAX,
+                    reference_word(seed, base),
+                    reference_word(seed, 0),
+                ] {
+                    pow.threshold = threshold;
+                    let expected = (0..MAX_SIMD_DEGREE)
+                        .filter_map(|lane| base.checked_add(lane as u64))
+                        .find(|&nonce| reference_word(seed, nonce) <= threshold);
+                    assert_eq!(
+                        pow.check_many(base),
+                        expected,
+                        "base={base}, threshold={threshold}"
+                    );
+                    for lane in 0..MAX_SIMD_DEGREE {
+                        if let Some(nonce) = base.checked_add(lane as u64) {
+                            assert_eq!(
+                                pow.outputs[lane * OUT_LEN..(lane + 1) * OUT_LEN],
+                                reference_hash(seed, nonce)
+                            );
+                            assert_eq!(pow.check(nonce), reference_word(seed, nonce) <= threshold);
+                        }
+                    }
+                }
             }
         }
-        panic!("Expected at least one valid nonce under threshold using check_many");
     }
 
     #[test]
-    fn test_check_many_handles_u64_tail() {
-        let mut pow = Blake3PoW::new([0u8; 32], 50);
-        let _ = pow.check_many(u64::MAX - 1);
-        assert_eq!(
-            u64::from_le_bytes(pow.inputs[0][32..40].try_into().unwrap()),
-            u64::MAX - 1
-        );
-        if MAX_SIMD_DEGREE > 2 {
-            assert_eq!(
-                u64::from_le_bytes(pow.inputs[2][32..40].try_into().unwrap()),
-                0
-            );
+    fn threshold_is_inclusive_and_difficulty_is_exact() {
+        let mut pow = Blake3PoW::new([7; 32], 0);
+        for (bits, threshold) in [
+            (0, u64::MAX),
+            (1, 0x7fff_ffff_ffff_ffff),
+            (32, 0xffff_ffff),
+            (59, 31),
+        ] {
+            assert_eq!(Blake3PoW::new([7; 32], bits).threshold, threshold);
         }
-    }
-
-    #[cfg(not(feature = "parallel"))]
-    #[test]
-    fn test_solve_sequential() {
-        let challenge = [2u8; 32];
-        let mut pow = Blake3PoW::new(challenge, 10);
-        let solution = pow.solve().expect("Should find a nonce");
-        assert!(
-            pow.check(solution),
-            "Found nonce does not satisfy challenge"
-        );
-    }
-
-    #[cfg(feature = "parallel")]
-    #[test]
-    fn test_solve_parallel() {
-        let challenge = [3u8; 32];
-        let mut pow = Blake3PoW::new(challenge, 10);
-        let _solution = pow.solve_parallel().expect("Should find a solution");
-        // Solution is valid by construction
+        let word = reference_word([7; 32], 23);
+        assert!(word > 0);
+        pow.threshold = word;
+        assert!(pow.check(23));
+        assert_eq!(pow.check_many(23), Some(23));
+        pow.threshold = word - 1;
+        assert!(!pow.check(23));
+        assert_ne!(pow.check_many(23), Some(23));
     }
 
     #[test]
-    fn test_different_challenges_consistency() {
-        let bits = 8;
-        for challenge in sample_challenges() {
-            let mut pow = Blake3PoW::new(challenge, bits);
-            let _solution = pow.solve().expect("Must find solution for low difficulty");
-            // Solution is valid by construction
-        }
-    }
-
-    #[test]
-    fn test_check_many_determinism() {
-        let challenge = [42u8; 32];
-        let mut pow1 = Blake3PoW::new(challenge, 10);
-        let mut pow2 = Blake3PoW::new(challenge, 10);
-
-        let n1 = pow1.check_many(0);
-        let n2 = pow2.check_many(0);
-        assert_eq!(n1, n2, "check_many should be deterministic");
-    }
-
-    #[test]
-    fn test_check_many_inserts_nonce_bytes() {
-        let challenge = [0xAB; 32];
-        let mut pow = Blake3PoW::new(challenge, 50);
-
-        // Run check_many to populate nonces.
-        let base_nonce = 12_345_678;
-        let _ = pow.check_many(base_nonce);
-
-        for (i, input) in pow.inputs.iter().enumerate() {
-            // Confirm prefix is unchanged
-            assert_eq!(&input[..32], &challenge);
-            // Confirm suffix is the correct nonce bytes
-            let expected_nonce = base_nonce + i as u64;
-            let actual = u64::from_le_bytes(input[32..40].try_into().unwrap());
-            assert_eq!(actual, expected_nonce);
-        }
-    }
-
-    #[test]
-    fn test_solve_returns_minimal_nonce() {
-        let c = [123; 32];
-        let mut pow = Blake3PoW::new(c, 10);
-        let mut best_nonce = None;
-        for nonce in (0..10000).step_by(MAX_SIMD_DEGREE) {
-            if let Some(found) = pow.check_many(nonce) {
-                best_nonce = Some(found);
-                break;
+    fn grinders_return_the_reference_minimum() {
+        for bits in [0, 8, 10] {
+            let seed = [3; 32];
+            let threshold = u64::MAX >> bits;
+            let expected = (0..=u64::MAX)
+                .find(|&nonce| reference_word(seed, nonce) <= threshold)
+                .unwrap();
+            let mut grinder = PoWGrinder::new(Blake3PoW::new(seed, bits));
+            assert_eq!(grinder.grind(), Some(expected));
+            assert_eq!(grind_pow(Blake3PoW::new(seed, bits)), Some(expected));
+            assert!(verify_pow(Blake3PoW::new(seed, bits), expected));
+            #[cfg(feature = "parallel")]
+            for workers in [1, 3, 4] {
+                let pool = rayon::ThreadPoolBuilder::new()
+                    .num_threads(workers)
+                    .build()
+                    .unwrap();
+                assert_eq!(pool.install(|| grinder.grind_parallel()), Some(expected));
             }
         }
-
-        // Get solution from solve()
-        let solution = pow.solve().expect("Should find a solution");
-
-        // If we found a nonce manually, create the same solution and compare
-        if let Some(nonce) = best_nonce {
-            let expected_solution = nonce;
-
-            assert_eq!(
-                solution, expected_solution,
-                "solve should return the first valid nonce"
-            );
-        }
     }
 
     #[test]
-    fn stress_test_check_many_entropy() {
-        let challenge = [42u8; 32];
-        let mut pow = Blake3PoW::new(challenge, 16);
-
-        let mut found = 0;
-        for nonce in (0..1_000_000).step_by(MAX_SIMD_DEGREE) {
-            if pow.check_many(nonce).is_some() {
-                found += 1;
-            }
-        }
-
-        // Should find some hits at low difficulty
-        assert!(found > 0, "Expected to find at least one solution");
+    #[should_panic(expected = "bits must be smaller than 60")]
+    fn rejects_unsupported_difficulty() {
+        let _ = Blake3PoW::new([0; 32], 60);
     }
 }

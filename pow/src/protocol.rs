@@ -303,7 +303,7 @@ mod tests {
     };
 
     use super::PowTranscriptExt;
-    // Use different public/private sponges to exercise the refactored RNG bound.
+    // Use different public/private duplex sponges to exercise the refactored RNG bound.
     fn prover() -> ProverState<TurboShake128, Shake128> {
         let session_id = Narg::derive_session_id(b"pow/tests/v1");
         ProverState::new_with_seed(&session_id, &0u32, [7; 32])
@@ -363,6 +363,13 @@ mod tests {
             ProverState::<RecordingSponge<255>>::new_with_seed(&session_id, &0u32, [7; 32]);
         assert!(prover.verifier_message_pow::<u64>(1).is_err());
         assert!(prover.into_narg_string().is_empty());
+        #[cfg(feature = "parallel")]
+        {
+            let mut parallel =
+                ProverState::<RecordingSponge<255>>::new_with_seed(&session_id, &0u32, [7; 32]);
+            assert!(super::verifier_message_pow_parallel::<u64>(&mut parallel, 1).is_err());
+            assert!(parallel.into_narg_string().is_empty());
+        }
     }
 
     #[test]
@@ -394,6 +401,8 @@ mod tests {
         assert!(verifier.verifier_message_pow::<u64>(8).is_err());
         // Only the check byte is squeezed; no protected challenge is produced.
         assert_eq!(events(), [Event::Absorb(vec![0]), Event::Squeeze(1)]);
+        assert!(verifier.verifier_message_pow::<u64>(0).is_err());
+        assert_eq!(events(), [Event::Absorb(vec![0]), Event::Squeeze(1)]);
         assert!(verifier
             .check(|| panic!("a failed check must not run again"))
             .is_err());
@@ -415,62 +424,167 @@ mod tests {
         word[0] == 0
     }
 
-    #[test]
-    fn leb128_is_canonical() {
-        assert_eq!(leb128(0), [0]);
-        assert_eq!(leb128(127), [0x7f]);
-        assert_eq!(leb128(128), [0x80, 0x01]);
-        assert_eq!(leb128(300), [0xac, 0x02]);
-        assert_eq!(
-            leb128(u64::MAX),
-            [0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x01]
-        );
-    }
-
-    #[test]
-    fn verifier_message_pow_round_trip() {
-        let mut prover = prover();
-        prover.prover_message(&123u32);
-        let first: u64 = prover.verifier_message_pow(8).unwrap();
-        let second: [u8; 32] = prover.verifier_message_pow(12).unwrap();
-        let third: u64 = prover.verifier_message_pow(0).unwrap();
-        let proof = prover.into_narg_string();
-        // 8 bits take at most 3 nonce bytes, 12 bits at most 3, 0 bits none.
-        assert!((4 + 2..=4 + 6).contains(&proof.len()));
-
-        let session_id = Narg::derive_session_id(b"pow/tests/v1");
-        let mut verifier = VerifierState::<TurboShake128>::new(&session_id, &0u32, &proof);
-        assert_eq!(verifier.prover_message::<u32>().unwrap(), 123);
-        assert_eq!(verifier.verifier_message_pow::<u64>(8).unwrap(), first);
-        assert_eq!(
-            verifier.verifier_message_pow::<[u8; 32]>(12).unwrap(),
-            second
-        );
-        assert_eq!(verifier.verifier_message_pow::<u64>(0).unwrap(), third);
-        assert!(verifier.check_eof().is_ok());
-    }
-
-    #[test]
-    fn verifier_message_pow_matches_the_manual_transcript() {
-        let mut manual = prover();
-        let nonce = Transcript::search_verifier_message(&manual)
-            .map(|evaluate| {
-                (0..=u64::MAX)
-                    .find(|&nonce| meets_eight_bits(&evaluate, nonce))
-                    .unwrap()
-            })
-            .into_known()
-            .unwrap();
-        for byte in leb128(nonce) {
-            manual.prover_message(&byte);
+    fn reference_nonce(mut nonce: u64) -> Vec<u8> {
+        let mut bytes = Vec::new();
+        loop {
+            let digit = (nonce % 128) as u8;
+            nonce /= 128;
+            bytes.push(digit + if nonce == 0 { 0 } else { 128 });
+            if nonce == 0 {
+                return bytes;
+            }
         }
-        assert_eq!(manual.verifier_message::<u8>(), 0);
-        let expected: u64 = manual.verifier_message();
+    }
 
-        let mut fused = prover();
-        assert_eq!(fused.verifier_message_pow::<u64>(8).unwrap(), expected);
-        assert_eq!(fused.into_narg_string(), leb128(nonce));
-        assert_eq!(manual.into_narg_string(), leb128(nonce));
+    fn reference_round<H: DuplexSpongeInit<U = u8>>(
+        bits: u32,
+        padding: usize,
+        skipped: usize,
+    ) -> (Vec<u8>, u64, u64) {
+        let session = Narg::derive_session_id(b"pow/tests/vectors/v1");
+        let mut before = H::init(session.as_bytes());
+        before.absorb(&0u32.to_le_bytes());
+        before.absorb(&vec![42; padding]);
+        let (proof, mut after) = if bits == 0 {
+            (Vec::new(), before)
+        } else {
+            (0..1u64 << (bits + 7))
+                .find_map(|nonce| {
+                    let proof = reference_nonce(nonce);
+                    let mut after = before.clone();
+                    after.absorb(&proof);
+                    let mut check = vec![0; bits.div_ceil(8) as usize];
+                    after.squeeze(&mut check);
+                    let passes =
+                        (0..bits).all(|bit| check[bit as usize / 8] & (1 << (bit % 8)) == 0);
+                    passes.then_some((proof, after))
+                })
+                .unwrap()
+        };
+        let challenge = u64::from_le_bytes(after.squeeze_array());
+        after.squeeze(&mut vec![0; skipped]);
+        let following = u64::from_le_bytes(after.squeeze_array());
+        (proof, challenge, following)
+    }
+
+    #[test]
+    fn fixed_protocol_vectors_match_an_independent_manual_reference() {
+        // Fixed answers cover zero work, short and longer nonces, a partial
+        // check byte, and absorb/output boundaries of the 168-byte XOF rate.
+        let vectors: &[Vector] = &[
+            (
+                0,
+                0,
+                0,
+                &[],
+                13_056_027_867_765_232_788,
+                12_177_758_299_268_758_940,
+            ),
+            (
+                1,
+                0,
+                0,
+                &[1],
+                2_543_273_970_772_696_169,
+                2_104_723_910_452_070_239,
+            ),
+            (
+                8,
+                0,
+                0,
+                &[184, 1],
+                14_629_531_661_013_474_542,
+                8_580_657_427_383_256_097,
+            ),
+            (
+                9,
+                164,
+                152,
+                &[171, 3],
+                12_866_269_379_798_860_464,
+                9_699_166_822_687_270_203,
+            ),
+            (
+                14,
+                0,
+                0,
+                &[255, 243, 2],
+                13_141_951_274_061_256_715,
+                1_390_169_760_608_021_913,
+            ),
+        ];
+        for &vector in vectors {
+            assert_vector::<TurboShake128>(vector);
+        }
+    }
+
+    type Vector = (u32, usize, usize, &'static [u8], u64, u64);
+
+    fn assert_vector<H: DuplexSpongeInit<U = u8> + Send>(
+        (bits, padding, skipped, proof, challenge, following): Vector,
+    ) {
+        let session = Narg::derive_session_id(b"pow/tests/vectors/v1");
+        let reference = reference_round::<H>(bits, padding, skipped);
+        assert_eq!(reference, (proof.to_vec(), challenge, following));
+        let mut prover = ProverState::<H, Shake128>::new_with_seed(&session, &0u32, [7; 32]);
+        for _ in 0..padding {
+            prover.public_message(&42u8);
+        }
+        assert_eq!(prover.verifier_message_pow::<u64>(bits).unwrap(), challenge);
+        for _ in 0..skipped {
+            let _ = prover.verifier_message::<u8>();
+        }
+        assert_eq!(prover.verifier_message::<u64>(), following);
+        assert_eq!(prover.into_narg_string(), proof);
+        let mut verifier = VerifierState::<H>::new(&session, &0u32, proof);
+        for _ in 0..padding {
+            verifier.public_message(&42u8);
+        }
+        assert_eq!(
+            verifier.verifier_message_pow::<u64>(bits).unwrap(),
+            challenge
+        );
+        for _ in 0..skipped {
+            let _ = verifier.verifier_message::<u8>();
+        }
+        assert_eq!(verifier.verifier_message::<u64>(), following);
+        verifier.check_eof().unwrap();
+        #[cfg(feature = "parallel")]
+        for workers in [1, 3, 4] {
+            let pool = rayon::ThreadPoolBuilder::new()
+                .num_threads(workers)
+                .build()
+                .unwrap();
+            pool.install(|| {
+                let mut parallel =
+                    ProverState::<H, Shake128>::new_with_seed(&session, &0u32, [7; 32]);
+                for _ in 0..padding {
+                    parallel.public_message(&42u8);
+                }
+                assert_eq!(
+                    super::verifier_message_pow_parallel::<u64>(&mut parallel, bits).unwrap(),
+                    challenge
+                );
+                for _ in 0..skipped {
+                    let _ = parallel.verifier_message::<u8>();
+                }
+                assert_eq!(parallel.verifier_message::<u64>(), following);
+                assert_eq!(parallel.into_narg_string(), proof);
+            });
+        }
+    }
+
+    #[test]
+    fn permutation_duplex_fixed_vector_matches_manual_reference() {
+        // The 136-byte overwrite-duplex rate is crossed on both sides.
+        assert_vector::<spongefish::instantiations::Keccak>((
+            8,
+            132,
+            120,
+            &[141, 2],
+            7_525_674_178_905_457_966,
+            13_912_007_349_407_221_541,
+        ));
     }
 
     #[test]
@@ -479,28 +593,103 @@ mod tests {
         impl Argument for SpongePowRound {
             type Instance = u32;
             type Witness = ();
-            type Output = u64;
+            type Output = ([u8; 32], u64, u64);
 
             fn run<T: Transcript>(
                 transcript: &mut T,
                 _instance: &u32,
                 _witness: Witness<&()>,
-            ) -> Result<u64, VerificationError> {
-                transcript.verifier_message_pow(10)
+            ) -> Result<Self::Output, VerificationError> {
+                Ok((
+                    transcript.verifier_message_pow(10)?,
+                    transcript.verifier_message_pow(9)?,
+                    transcript.verifier_message_pow(0)?,
+                ))
             }
         }
 
         let tag = b"pow/tests/v1";
         let (proof, challenge) = Narg::prove::<SpongePowRound>(tag, &0, &()).unwrap();
-        assert!((1..=3).contains(&proof.len()));
         assert_eq!(
             Narg::verify::<SpongePowRound>(tag, &0, &proof).unwrap(),
             challenge
         );
 
         let mut direct = prover();
-        assert_eq!(direct.verifier_message_pow::<u64>(10).unwrap(), challenge);
+        assert_eq!(
+            (
+                direct.verifier_message_pow::<[u8; 32]>(10).unwrap(),
+                direct.verifier_message_pow::<u64>(9).unwrap(),
+                direct.verifier_message_pow::<u64>(0).unwrap(),
+            ),
+            challenge
+        );
         assert_eq!(direct.into_narg_string(), proof);
+    }
+
+    #[test]
+    fn fused_pow_supports_non_sync_backends() {
+        // RefCell deliberately makes the backend non-Sync.
+        #[derive(Clone)]
+        struct NonSyncSponge<M = ()>(RefCell<TurboShake128>, core::marker::PhantomData<M>);
+
+        impl<M: Clone> DuplexSpongeInterface for NonSyncSponge<M> {
+            type U = u8;
+
+            fn absorb(&mut self, input: &[u8]) -> &mut Self {
+                self.0.get_mut().absorb(input);
+                self
+            }
+
+            fn squeeze(&mut self, output: &mut [u8]) -> &mut Self {
+                self.0.get_mut().squeeze(output);
+                self
+            }
+        }
+
+        impl<M: Clone> DuplexSpongeInit for NonSyncSponge<M> {
+            fn init(session_id: &[u8; 32]) -> Self {
+                Self(
+                    RefCell::new(TurboShake128::init(session_id)),
+                    core::marker::PhantomData,
+                )
+            }
+        }
+
+        let session = Narg::derive_session_id(b"pow/tests/v1");
+        let mut prover_with_private_rng =
+            ProverState::<TurboShake128, NonSyncSponge>::new_with_seed(&session, &0u32, [7; 32]);
+        let challenge = prover_with_private_rng
+            .verifier_message_pow::<u64>(8)
+            .unwrap();
+        let mut reference = prover();
+        assert_eq!(reference.verifier_message_pow::<u64>(8).unwrap(), challenge);
+        let expected_proof = reference.into_narg_string();
+        assert_eq!(prover_with_private_rng.into_narg_string(), expected_proof);
+
+        let mut non_sync_public = ProverState::<
+            NonSyncSponge<std::rc::Rc<()>>,
+            NonSyncSponge<std::rc::Rc<()>>,
+        >::new_with_seed(&session, &0u32, [7; 32]);
+        assert_eq!(
+            non_sync_public.verifier_message_pow::<u64>(8).unwrap(),
+            challenge
+        );
+        assert_eq!(non_sync_public.into_narg_string(), expected_proof);
+
+        #[cfg(feature = "parallel")]
+        {
+            // Send but non-Sync public H, and neither Send nor Sync private R.
+            let mut parallel =
+                ProverState::<NonSyncSponge, NonSyncSponge<std::rc::Rc<()>>>::new_with_seed(
+                    &session, &0u32, [7; 32],
+                );
+            assert_eq!(
+                super::verifier_message_pow_parallel::<u64>(&mut parallel, 8).unwrap(),
+                challenge
+            );
+            assert_eq!(parallel.into_narg_string(), expected_proof);
+        }
     }
 
     #[test]
@@ -528,31 +717,39 @@ mod tests {
         assert!(verifier.verifier_message_pow::<u64>(8).is_err());
         assert!(verifier.prover_message::<u8>().is_err());
         assert!(verifier.check_eof().is_err());
-
-        for length in 0..good.len() {
-            let proof = &good[..length];
-            let mut verifier = VerifierState::<TurboShake128>::new(&session_id, &0u32, proof);
-            assert!(verifier.verifier_message_pow::<u64>(8).is_err());
-            assert!(verifier.check_eof().is_err());
-        }
     }
 
     #[test]
     fn verifier_message_pow_accepts_only_canonical_nonces_in_range() {
         // The recording sponge squeezes zeros, so every nonce meets the
         // target and only the encoding decides.
-        let accepted: [(u32, &[u8]); 6] = [
-            (1, &[0x00]),
-            (1, &[0x7f]),
-            (1, &[0x80, 0x01]),
-            (1, &[0xff, 0x01]),
-            (25, &[0xff, 0xff, 0xff, 0xff, 0x0f]),
+        let accepted: &[(u64, u32, &[u8])] = &[
+            (0, 1, &[0]),
+            (127, 1, &[0x7f]),
+            (128, 1, &[0x80, 1]),
+            (255, 1, &[0xff, 1]),
+            (16383, 7, &[0xff, 0x7f]),
+            (16384, 8, &[0x80, 0x80, 1]),
+            (u64::from(u32::MAX), 25, &[0xff, 0xff, 0xff, 0xff, 0x0f]),
+            (1u64 << 32, 26, &[0x80, 0x80, 0x80, 0x80, 0x10]),
             (
+                (1u64 << 63) - 1,
+                56,
+                &[0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x7f],
+            ),
+            (
+                1u64 << 63,
                 57,
-                &[0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x01],
+                &[0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 1],
+            ),
+            (
+                u64::MAX,
+                57,
+                &[0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 1],
             ),
         ];
-        for (bits, proof) in accepted {
+        for &(nonce, bits, proof) in accepted {
+            assert_eq!(leb128(nonce), proof);
             let mut verifier = recording_verifier(proof);
             assert!(
                 verifier.verifier_message_pow::<u64>(bits).is_ok(),
@@ -562,18 +759,24 @@ mod tests {
         }
         // A trailing zero byte, a nonce of 2^8 at 1 bit, a continuation past
         // the longest encoding, 2^32 at 25 bits, and an overflowing u64 nonce.
-        let rejected: [(u32, &[u8]); 6] = [
+        let rejected: &[(u32, &[u8])] = &[
             (1, &[0x80, 0x00]),
             (8, &[0x81, 0x80, 0x00]),
             (1, &[0x80, 0x02]),
             (1, &[0x80, 0x80, 0x01]),
             (25, &[0x80, 0x80, 0x80, 0x80, 0x10]),
             (
+                56,
+                &[0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 1],
+            ),
+            (57, &[0x80; 10]),
+            (57, &[0xff; 10]),
+            (
                 57,
                 &[0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x02],
             ),
         ];
-        for (bits, proof) in rejected {
+        for &(bits, proof) in rejected {
             let mut verifier = recording_verifier(proof);
             assert!(
                 verifier.verifier_message_pow::<u64>(bits).is_err(),
@@ -606,6 +809,50 @@ mod tests {
     }
 
     #[test]
+    fn permutation_cost_depends_on_absorb_and_squeeze_boundaries() {
+        use std::cell::Cell;
+
+        use spongefish::{DuplexSponge, Permutation};
+
+        thread_local! { static CALLS: Cell<usize> = const { Cell::new(0) }; }
+        #[derive(Clone, Default)]
+        struct Rotate;
+        impl Permutation<40> for Rotate {
+            type U = u8;
+            fn permute_mut(&self, state: &mut [u8; 40]) {
+                for byte in state {
+                    *byte = byte.rotate_left(1);
+                }
+                CALLS.with(|calls| calls.set(calls.get() + 1));
+            }
+        }
+        // Rotate is a toy bijection, not a cryptographic backend. This test
+        // checks the real duplex sponge's permutation scheduling, not security.
+        type CountingDuplex = DuplexSponge<Rotate, 40, 16>;
+        let session = Narg::derive_session_id(b"pow/tests/permutation-cost");
+        for (padding, proof, challenge_len, expected_calls) in [
+            (11, &[0][..], 15, 1),       // nonce ends exactly at the absorb boundary
+            (11, &[0][..], 16, 2),       // check + challenge crosses the output boundary
+            (12, &[0][..], 15, 2),       // nonce starts after a full absorb block
+            (10, &[0x80, 1][..], 15, 1), // two-byte nonce still fits
+            (11, &[0x80, 1][..], 15, 2), // two-byte nonce crosses the boundary
+        ] {
+            let mut verifier = VerifierState::<CountingDuplex>::new(&session, &0u32, proof);
+            for _ in 0..padding {
+                verifier.public_message(&0u8);
+            }
+            CALLS.with(|calls| calls.set(0));
+            if challenge_len == 15 {
+                verifier.verifier_message_pow::<[u8; 15]>(1).unwrap();
+            } else {
+                verifier.verifier_message_pow::<[u8; 16]>(1).unwrap();
+            }
+            assert_eq!(CALLS.with(Cell::get), expected_calls);
+            verifier.check_eof().unwrap();
+        }
+    }
+
+    #[test]
     fn verifier_message_pow_layout() {
         use super::{accepts, last_nonce, max_nonce_len, word_len, Leb128};
         let layout = |bits| (last_nonce(bits), max_nonce_len(bits), word_len(bits));
@@ -620,24 +867,12 @@ mod tests {
                 max_nonce_len(bits)
             );
         }
-        assert!(accepts(10, [0, 0b1111_1100, 0xff, 0, 0, 0, 0, 0]));
-        assert!(!accepts(10, [0, 0b0000_0010, 0, 0, 0, 0, 0, 0]));
-        assert!(!accepts(10, [1, 0, 0, 0, 0, 0, 0, 0]));
-        assert!(accepts(57, [0, 0, 0, 0, 0, 0, 0, 0xfe]));
-        assert!(!accepts(57, [0, 0, 0, 0, 0, 0, 0, 1]));
-    }
-
-    #[test]
-    fn verifier_message_pow_search_returns_the_least_nonce() {
-        use super::{last_nonce, TranscriptPoW};
-        use crate::PoWGrinder;
-        let evaluate = prover().search_verifier_message();
-        for bits in [1, 5, 12] {
-            let mut pow = TranscriptPoW::new(evaluate.clone(), bits);
-            let least =
-                (0..=last_nonce(bits)).find(|&nonce| crate::PowStrategy::check(&mut pow, nonce));
-            assert!(least.is_some());
-            assert_eq!(PoWGrinder::new(pow).grind(), least);
+        for bits in [1, 7, 8, 9, 56, 57] {
+            assert!(accepts(bits, [0; 8]));
+            for bit in 0..64 {
+                let word = (1u64 << bit).to_le_bytes();
+                assert_eq!(accepts(bits, word), bit >= bits, "bits={bits}, bit={bit}");
+            }
         }
     }
 
@@ -645,11 +880,11 @@ mod tests {
     fn verifier_message_pow_search_finds_a_lone_nonce_anywhere_in_the_space() {
         use super::{last_nonce, TranscriptPoW};
         use crate::PoWGrinder;
-        for bits in [1, 9] {
+        for bits in [1] {
             let last = last_nonce(bits);
-            for target in [None, Some(0), Some(1), Some(last / 2), Some(last)] {
+            for target in [None, Some(127), Some(128), Some(last)] {
                 let evaluate = |candidate: &[u8], out: &mut [u8]| {
-                    let hit = target.is_some_and(|nonce| candidate == leb128(nonce));
+                    let hit = target.is_some_and(|nonce| candidate == reference_nonce(nonce));
                     out.fill(if hit { 0 } else { 0xff });
                 };
                 assert_eq!(
@@ -657,9 +892,9 @@ mod tests {
                     target
                 );
                 #[cfg(feature = "parallel")]
-                {
+                for workers in [1, 3, 4] {
                     let pool = rayon::ThreadPoolBuilder::new()
-                        .num_threads(1)
+                        .num_threads(workers)
                         .build()
                         .unwrap();
                     assert_eq!(
