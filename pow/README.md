@@ -12,7 +12,7 @@ It has not been reviewed, and should be considered a proof-of-concept example th
 
 The `PowTranscriptExt` extension adds a proof-of-work step to every `Transcript`. It works both inside a generic `Argument::run` and directly on `ProverState` and `VerifierState`. The step returns `Result<(), VerificationError>`; callers then obtain the protected verifier message. The standalone `PoWGrinder` and convenience functions remain available for other integrations.
 
-Both parties exchange a compact nonce and check bytes squeezed from the public duplex sponge. The caller then draws the protected verifier message. A rejected or truncated nonce poisons the verifier.
+Both parties exchange a compact nonce and check bytes squeezed from the public duplex sponge. The caller then draws the protected verifier message. A rejected or truncated nonce poisons the verifier. Generic transcript search is sequential even with `parallel`; standalone prepared strategies still provide explicit parallel execution.
 
 Use the default features of `spongefish` and `spongefish-pow` for this example:
 

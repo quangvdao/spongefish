@@ -4,8 +4,8 @@ use core::fmt;
 #[cfg(feature = "turboshake128")]
 use crate::DefaultHash;
 use crate::{
-    duplex_sponge::DuplexSpongeInit, DuplexSpongeInterface, Encoding, FromUniform, MessageSearch,
-    PrivateRng, SessionId,
+    duplex_sponge::DuplexSpongeInit, DuplexSpongeInterface, Encoding, FromUniform, PrivateRng,
+    SessionId,
 };
 
 /// [`ProverState`] is the prover state in the non-interactive transformation.
@@ -19,7 +19,7 @@ use crate::{
 /// instance. Most protocols should use [`Narg::prove`][crate::Narg::prove]
 /// directly.
 ///
-/// The private RNG is a [`PrivateRng`] over `R`, independently of the sponge
+/// The private RNG is a [`PrivateRng`] over `R`, independently of the duplex sponge
 /// `H` carrying the public coins.
 ///
 /// # Example
@@ -221,16 +221,21 @@ where
         self.narg_string
     }
 
-    /// Return a read-only view of the public sponge for searching over the
-    /// next prover message.
-    ///
-    /// See [`MessageSearch`] for what the view can and cannot do. A probe of
-    /// `candidate` returns the same bytes as [`ProverState::prover_message`]
-    /// with an encoding `candidate`, followed by
-    /// [`ProverState::verifier_message`], but leaves this state unchanged.
-    #[must_use]
-    pub fn message_search(&self) -> MessageSearch<H> {
-        MessageSearch::new(self.duplex_sponge_state.clone())
+    /// Return an owned, clonable callback that evaluates verifier output for
+    /// candidate prover messages.
+    /// Each call absorbs the candidate, encoded in the duplex sponge's alphabet,
+    /// into a fresh copy of the captured public duplex sponge and squeezes into
+    /// the supplied output.
+    /// The prover state and private RNG stay untouched;
+    /// [`crate::Transcript::search_verifier_message`] wraps this callback in
+    /// [`crate::Witness`] for prover-only computation.
+    pub fn search_verifier_message(&self) -> impl Fn(&[H::U], &mut [H::U]) + Clone {
+        let snapshot = self.duplex_sponge_state.clone();
+        move |candidate, output| {
+            let mut sponge = snapshot.clone();
+            sponge.absorb(candidate);
+            sponge.squeeze(output);
+        }
     }
 
     /// Return a verifier message `T` that is uniformly distributed.

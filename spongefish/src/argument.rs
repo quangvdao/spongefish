@@ -4,7 +4,7 @@ use core::marker::PhantomData;
 #[cfg(feature = "turboshake128")]
 use crate::DefaultHash;
 use crate::{
-    DuplexSpongeInit, DuplexSpongeInterface, Encoding, FromNarg, FromUniform, Probe, ProverState,
+    DuplexSpongeInit, DuplexSpongeInterface, Encoding, FromNarg, FromUniform, ProverState,
     VerificationError, VerifierState,
 };
 
@@ -245,59 +245,15 @@ pub trait Transcript {
     /// ```
     fn prover_only<T>(&self, compute: impl FnOnce() -> T) -> Witness<T>;
 
-    /// Search for a prover message using the public transcript state.
-    ///
-    /// The prover runs `search` with a [`Probe`], which reports the verifier
-    /// message bytes that each candidate prover message would produce, without
-    /// changing the transcript. The verifier runs nothing and gets
-    /// [`Witness::unknown`]. Send the result with
-    /// [`Transcript::prover_message`] and check the predicate with
-    /// [`Transcript::check`], as for [`Transcript::prover_only`].
-    ///
-    /// The default implementation returns [`Witness::unknown`]. Whether a
-    /// prover then fails depends on its transcript: [`ProverState`] rejects an
-    /// unknown prover message, so it fails when it tries to send the result.
-    /// Proving transcripts that need local prover input should do the same.
-    ///
-    /// # Example
-    ///
-    /// ```
-    /// # #[cfg(all(feature = "turboshake128", feature = "getrandom"))]
-    /// # {
-    /// # use spongefish::{Argument, Narg, Probe, Transcript, VerificationError, Witness};
-    /// fn small_challenge<T: Transcript>(transcript: &mut T) -> Result<u8, VerificationError> {
-    ///     let nonce = transcript
-    ///         .prover_search(|probe| {
-    ///             (0..=u64::MAX).find(|n| {
-    ///                 let mut next = [0u8; 1];
-    ///                 probe.probe(&n.to_le_bytes(), &mut next);
-    ///                 next[0] < 16
-    ///             })
-    ///         })
-    ///         .map(|nonce| nonce.ok_or(VerificationError))
-    ///         .transpose()?;
-    ///     transcript.prover_message::<u64>(nonce)?;
-    ///     let challenge: u8 = transcript.verifier_message();
-    ///     transcript.check(|| challenge < 16)?;
-    ///     Ok(challenge)
-    /// }
-    /// #
-    /// # struct Small;
-    /// # impl Argument for Small {
-    /// #     type Instance = u8;
-    /// #     type Witness = ();
-    /// #     type Output = u8;
-    /// #     fn run<T: Transcript>(t: &mut T, _: &u8, _: Witness<&()>) -> Result<u8, VerificationError> {
-    /// #         small_challenge(t)
-    /// #     }
-    /// # }
-    /// # let (proof, c) = Narg::prove::<Small>(b"examples/search", &0, &()).unwrap();
-    /// # assert_eq!(Narg::verify::<Small>(b"examples/search", &0, &proof).unwrap(), c);
-    /// # }
-    /// ```
-    fn prover_search<T>(&self, search: impl FnOnce(&dyn Probe) -> T) -> Witness<T> {
-        let _ = search;
-        Witness::unknown()
+    /// Return a prover-only, owned and clonable callback in [`Witness`] that
+    /// evaluates verifier output for candidate prover messages.
+    /// Each call absorbs the encoded candidate into a fresh copy of the captured
+    /// public duplex sponge and squeezes into the supplied output, without changing
+    /// the prover state or accessing the private RNG.
+    /// The verifier and the default implementation return [`Witness::unknown`];
+    /// [`ProverState::search_verifier_message`] returns the callback directly.
+    fn search_verifier_message(&self) -> Witness<impl Fn(&[u8], &mut [u8]) + Clone + use<Self>> {
+        Witness::<fn(&[u8], &mut [u8])>::unknown()
     }
 
     /// Sample a random element using the prover's private randomness.
@@ -409,7 +365,7 @@ impl<A: Argument> NoState<A> {
 
 // --- the DSFS transformation ---------------------------------------------------------
 
-impl<H: DuplexSpongeInterface<U = u8> + Sync, R: DuplexSpongeInit<U = u8>> Transcript
+impl<H: DuplexSpongeInterface<U = u8>, R: DuplexSpongeInit<U = u8>> Transcript
     for ProverState<H, R>
 {
     fn prover_message<T>(&mut self, value: Witness<T>) -> Result<T, VerificationError>
@@ -435,8 +391,8 @@ impl<H: DuplexSpongeInterface<U = u8> + Sync, R: DuplexSpongeInit<U = u8>> Trans
         Witness::known(compute())
     }
 
-    fn prover_search<T>(&self, search: impl FnOnce(&dyn Probe) -> T) -> Witness<T> {
-        Witness::known(search(&self.message_search()))
+    fn search_verifier_message(&self) -> Witness<impl Fn(&[u8], &mut [u8]) + Clone + use<H, R>> {
+        Witness::known(Self::search_verifier_message(self))
     }
 
     fn sample<T: FromUniform>(&mut self) -> Witness<T> {
@@ -477,10 +433,6 @@ impl<H: DuplexSpongeInterface<U = u8>> Transcript for VerifierState<'_, H> {
     }
 
     fn prover_only<T>(&self, _compute: impl FnOnce() -> T) -> Witness<T> {
-        Witness::unknown()
-    }
-
-    fn prover_search<T>(&self, _search: impl FnOnce(&dyn Probe) -> T) -> Witness<T> {
         Witness::unknown()
     }
 
@@ -536,10 +488,7 @@ impl<H: DuplexSpongeInit<U = u8>> FiatShamir<H> {
         tag: &[u8],
         instance: &A::Instance,
         witness: &A::Witness,
-    ) -> Result<(alloc::vec::Vec<u8>, A::Output), VerificationError>
-    where
-        H: Sync,
-    {
+    ) -> Result<(alloc::vec::Vec<u8>, A::Output), VerificationError> {
         let session_id = Self::derive_session_id(tag);
         Self::prove_with_session_id::<A>(&session_id, instance, witness)
     }
@@ -550,10 +499,7 @@ impl<H: DuplexSpongeInit<U = u8>> FiatShamir<H> {
         session_id: &crate::SessionId,
         instance: &A::Instance,
         witness: &A::Witness,
-    ) -> Result<(alloc::vec::Vec<u8>, A::Output), VerificationError>
-    where
-        H: Sync,
-    {
+    ) -> Result<(alloc::vec::Vec<u8>, A::Output), VerificationError> {
         let () = NoState::<A>::ASSERT;
         let mut prover_state = ProverState::<H>::new(session_id, instance);
         let output = A::run(&mut prover_state, instance, Witness::known(witness))?;

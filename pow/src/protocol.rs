@@ -1,6 +1,6 @@
 //! An interactive proof-of-work step shared by every transcript implementation.
 
-use spongefish::{Probe, Transcript, VerificationError};
+use spongefish::{Transcript, VerificationError};
 
 /// Proof-of-work-protected verifier messages for interactive transcripts.
 ///
@@ -72,7 +72,8 @@ pub trait PowTranscriptExt: Transcript {
     /// byte, with probability `1 - (1 - 2^-bits)^128`: at least `1 - e^-8` for
     /// `bits <= 4`. The nonce space holds `2^7` times the expected number of
     /// trials, so for an ideal sponge an honest search fails with probability
-    /// at most `e^-128`. The prover searches with [`Transcript::prover_search`].
+    /// at most `e^-128`. The prover searches sequentially with
+    /// [`Transcript::search_verifier_message`], even when the `parallel` feature is enabled.
     ///
     /// ```
     /// use spongefish::{Argument, Narg, Transcript, VerificationError, Witness};
@@ -128,7 +129,7 @@ pub trait PowTranscriptExt: Transcript {
     ///
     /// The prover returns [`VerificationError`] if the search exhausts the
     /// nonce space, or if the transcript does not support
-    /// [`Transcript::prover_search`] and rejects the resulting unknown prover
+    /// [`Transcript::search_verifier_message`] and rejects the resulting unknown prover
     /// message, as [`ProverState`](spongefish::ProverState) does. For
     /// `bits > 0`, the verifier returns it if the nonce is not canonical,
     /// exceeds the nonce space or misses the target, if the proof is
@@ -144,7 +145,8 @@ pub trait PowTranscriptExt: Transcript {
             return Ok(());
         }
         let nonce = self
-            .prover_search(|probe| pow.search(probe))
+            .search_verifier_message()
+            .map(|evaluate| pow.search(&evaluate))
             .map(|nonce| nonce.ok_or(VerificationError))
             .transpose()?
             .map(Leb128::new);
@@ -206,42 +208,15 @@ impl SpongePow {
     }
 
     /// Whether sending `nonce` makes the next squeezed bytes pass the check.
-    fn accepts_nonce(self, probe: &dyn Probe, nonce: u32) -> bool {
+    fn accepts_nonce(self, evaluate: &impl Fn(&[u8], &mut [u8]), nonce: u32) -> bool {
         let mut word = [0u8; 4];
-        probe.probe(Leb128::new(nonce).as_bytes(), &mut word[..self.word_len()]);
+        evaluate(Leb128::new(nonce).as_bytes(), &mut word[..self.word_len()]);
         self.accepts(word)
     }
 
     /// The least accepted nonce.
-    #[cfg(not(feature = "parallel"))]
-    fn search(self, probe: &dyn Probe) -> Option<u32> {
-        (0..=self.last_nonce()).find(|&nonce| self.accepts_nonce(probe, nonce))
-    }
-
-    /// The least accepted nonce, searched on all threads. The result equals
-    /// the sequential search.
-    #[cfg(feature = "parallel")]
-    fn search(self, probe: &dyn Probe) -> Option<u32> {
-        use std::sync::atomic::{AtomicU64, Ordering};
-
-        // `u64::MAX` is no nonce, so it marks "not found".
-        let least = AtomicU64::new(u64::MAX);
-        rayon::broadcast(|ctx| {
-            // Each thread scans its own residue class in increasing order and
-            // stops once it cannot beat the least nonce found so far.
-            let nonces =
-                (ctx.index() as u64..=u64::from(self.last_nonce())).step_by(ctx.num_threads());
-            for nonce in nonces {
-                if nonce >= least.load(Ordering::Relaxed) {
-                    break;
-                }
-                if self.accepts_nonce(probe, nonce as u32) {
-                    least.fetch_min(nonce, Ordering::SeqCst);
-                    break;
-                }
-            }
-        });
-        u32::try_from(least.into_inner()).ok()
+    fn search(self, evaluate: &impl Fn(&[u8], &mut [u8])) -> Option<u32> {
+        (0..=self.last_nonce()).find(|&nonce| self.accepts_nonce(evaluate, nonce))
     }
 }
 
@@ -282,8 +257,8 @@ mod tests {
 
     use spongefish::{
         instantiations::{Shake128, TurboShake128},
-        Argument, DuplexSpongeInit, DuplexSpongeInterface, MessageSearch, Narg, Probe, ProverState,
-        Transcript, VerificationError, VerifierState, Witness,
+        Argument, DuplexSpongeInit, DuplexSpongeInterface, Narg, ProverState, Transcript,
+        VerificationError, VerifierState, Witness,
     };
 
     use super::PowTranscriptExt;
@@ -347,9 +322,9 @@ mod tests {
     }
 
     /// Bits 0..8 of the next squeezed byte after sending `nonce` are zero.
-    fn meets_eight_bits(search: &MessageSearch<TurboShake128>, nonce: u32) -> bool {
+    fn meets_eight_bits(search: &impl Fn(&[u8], &mut [u8]), nonce: u32) -> bool {
         let mut word = [0u8; 1];
-        search.probe(&leb128(nonce), &mut word);
+        search(&leb128(nonce), &mut word);
         word[0] == 0
     }
 
@@ -391,7 +366,7 @@ mod tests {
     #[test]
     fn sponge_pow_matches_the_manual_transcript() {
         let mut manual = prover();
-        let search = manual.message_search();
+        let search = manual.search_verifier_message();
         let nonce = (0..=u32::MAX)
             .find(|&nonce| meets_eight_bits(&search, nonce))
             .unwrap();
@@ -444,7 +419,7 @@ mod tests {
     fn sponge_pow_rejects_a_nonce_that_misses_the_target() {
         let session_id = Narg::derive_session_id(b"pow/tests/v1");
         // The prover and verifier sponges agree before the nonce.
-        let search = prover().message_search();
+        let search = prover().search_verifier_message();
         let good = leb128(
             (0..=u32::MAX)
                 .find(|&n| meets_eight_bits(&search, n))
@@ -555,7 +530,7 @@ mod tests {
     #[test]
     fn sponge_pow_search_returns_the_least_nonce() {
         use super::SpongePow;
-        let search = prover().message_search();
+        let search = prover().search_verifier_message();
         for bits in [1, 5, 12] {
             let pow = SpongePow::new(bits);
             let least = (0..=pow.last_nonce()).find(|&nonce| pow.accepts_nonce(&search, nonce));
@@ -565,11 +540,9 @@ mod tests {
     }
 
     /// Accepts exactly one nonce, or none.
-    struct AcceptOnly(Option<u32>);
-
-    impl Probe for AcceptOnly {
-        fn probe(&self, candidate: &[u8], out: &mut [u8]) {
-            let hit = self.0.is_some_and(|target| candidate == leb128(target));
+    fn accept_only(target: Option<u32>) -> impl Fn(&[u8], &mut [u8]) {
+        move |candidate, out| {
+            let hit = target.is_some_and(|nonce| candidate == leb128(nonce));
             out.fill(if hit { 0 } else { 0xff });
         }
     }
@@ -581,18 +554,7 @@ mod tests {
             let pow = SpongePow::new(bits);
             let last = pow.last_nonce();
             for target in [None, Some(0), Some(1), Some(last / 2), Some(last)] {
-                assert_eq!(pow.search(&AcceptOnly(target)), target);
-                #[cfg(feature = "parallel")]
-                {
-                    let one_thread = rayon::ThreadPoolBuilder::new()
-                        .num_threads(1)
-                        .build()
-                        .unwrap();
-                    assert_eq!(
-                        one_thread.install(|| pow.search(&AcceptOnly(target))),
-                        target
-                    );
-                }
+                assert_eq!(pow.search(&accept_only(target)), target);
             }
         }
     }

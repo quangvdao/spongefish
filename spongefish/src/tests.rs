@@ -3,8 +3,8 @@ use alloc::format;
 use shake::{ExtendableOutput, Update, XofReader};
 
 use crate::{
-    derive_session_id, Argument, DefaultHash, Encoding, FromNarg, Narg, PrivateRng, Probe,
-    ProverState, SessionId, Transcript, VerificationError, VerifierState, Witness,
+    derive_session_id, Argument, DefaultHash, Encoding, FromNarg, Narg, PrivateRng, ProverState,
+    SessionId, Transcript, VerificationError, VerifierState, Witness,
 };
 
 fn test_session_id(tag: &[u8]) -> SessionId {
@@ -619,9 +619,7 @@ fn probe_matches_sending_the_candidate_then_squeezing() {
     let mut probed = new_prover();
     let narg_before = probed.narg_string().to_vec();
     let mut predicted = [0u8; 200];
-    probed
-        .message_search()
-        .probe(7u64.encode().as_ref(), &mut predicted);
+    probed.search_verifier_message()(7u64.encode().as_ref(), &mut predicted);
     // Probing changes neither the NARG string nor the later transcript.
     assert_eq!(probed.narg_string(), narg_before);
     let mut untouched = new_prover();
@@ -639,16 +637,15 @@ fn probe_matches_sending_the_candidate_then_squeezing() {
 fn prover_search_runs_only_on_the_prover() {
     let session_id = test_session_id(b"message search");
     let prover = ProverState::<DefaultHash>::new_with_seed(&session_id, &[3u32], [1; 32]);
-    let found = Transcript::prover_search(&prover, |probe| {
+    let found = Transcript::search_verifier_message(&prover).map(|evaluate| {
         let mut out = [0u8; 4];
-        probe.probe(&[1, 2, 3], &mut out);
+        evaluate(&[1, 2, 3], &mut out);
         out
     });
     assert!(found.into_known().is_some());
 
     let verifier = VerifierState::<DefaultHash>::new(&session_id, &[3u32], &[]);
-    let skipped = Transcript::prover_search(&verifier, |_| -> u8 {
-        panic!("the verifier must not run the search")
-    });
+    let skipped = Transcript::search_verifier_message(&verifier)
+        .map(|_| -> u8 { panic!("the verifier must not run the search") });
     assert!(skipped.into_known().is_none());
 }
