@@ -10,29 +10,31 @@ It has not been reviewed, and should be considered a proof-of-concept example th
 
 ## Wiring into a NARG
 
-The `PowTranscriptExt` extension adds a proof-of-work step to every `Transcript`. It works both inside a generic `Argument::run` and directly on `ProverState` and `VerifierState`. Both sides return `Result<T, VerificationError>`. The standalone `PoWGrinder` and convenience functions remain available for other integrations.
+The `PowTranscriptExt` extension adds a proof-of-work step to every `Transcript`. It works both inside a generic `Argument::run` and directly on `ProverState` and `VerifierState`. The step returns `Result<(), VerificationError>`; callers then obtain the protected verifier message. The standalone `PoWGrinder` and convenience functions remain available for other integrations.
 
-Both parties execute the same protocol: obtain a 32-byte grinding challenge, exchange a nonce, check it, then obtain the protected verifier message. `Transcript::prover_only` runs the nonce search only on the prover. A rejected or truncated nonce poisons the verifier.
+Both parties exchange a compact nonce and check bytes squeezed from the public duplex sponge. The caller then draws the protected verifier message. A rejected or truncated nonce poisons the verifier.
 
 Use the default features of `spongefish` and `spongefish-pow` for this example:
 
 ```rust
 use spongefish::{DefaultHash, Narg, ProverState, VerificationError, VerifierState};
-use spongefish_pow::{blake3::Blake3PoW, PowTranscriptExt};
+use spongefish_pow::PowTranscriptExt;
 
 // Fixed by the protocol, never read from the proof.
-const POW_BITS: f64 = 8.0;
+const POW_BITS: u32 = 8;
 
 fn main() -> Result<(), VerificationError> {
-    let session_id = Narg::derive_session_id(b"example/v1/blake3-pow-8/u32");
+    let session_id = Narg::derive_session_id(b"example/v1/sponge-pow-8/u32");
     let instance = 0u32;
 
     let mut prover = ProverState::<DefaultHash>::new(&session_id, &instance);
-    let challenge = prover.verifier_message_pow::<u32, Blake3PoW>(POW_BITS)?;
+    prover.sponge_pow(POW_BITS)?;
+    let challenge = prover.verifier_message::<u32>();
     let proof = prover.into_narg_string();
 
     let mut verifier = VerifierState::<DefaultHash>::new(&session_id, &instance, &proof);
-    let replay = verifier.verifier_message_pow::<u32, Blake3PoW>(POW_BITS)?;
+    verifier.sponge_pow(POW_BITS)?;
+    let replay = verifier.verifier_message::<u32>();
     assert_eq!(challenge, replay);
     verifier.check_eof()
 }
@@ -42,7 +44,7 @@ The same method is available with only a `Transcript` bound, so an interactive a
 
 ```rust
 use spongefish::{Argument, Transcript, VerificationError, Witness};
-use spongefish_pow::{blake3::Blake3PoW, PowTranscriptExt};
+use spongefish_pow::PowTranscriptExt;
 
 struct PowRound;
 impl Argument for PowRound {
@@ -55,9 +57,29 @@ impl Argument for PowRound {
         _instance: &u32,
         _witness: Witness<&()>,
     ) -> Result<u32, VerificationError> {
-        transcript.verifier_message_pow::<u32, Blake3PoW>(8.0)
+        transcript.sponge_pow(8)?;
+        Ok(transcript.verifier_message())
     }
 }
 ```
 
-The nonce is encoded as a little-endian `u64`. The PoW strategy, difficulty, placement of the step, and returned message type must be fixed by the protocol and accounted for in its session tag. The example uses a cheap difficulty for demonstration; the appropriate work factor and soundness benefit depend on the protocol.
+The nonce is canonical LEB128 below `2^(bits + 7)`, with integer difficulty at most 25. The sponge backend, difficulty, placement of the step, and protected message type must be fixed by the protocol and accounted for in its session tag. The example uses a cheap difficulty for demonstration; the appropriate work factor and soundness benefit depend on the protocol.
+
+## Prepared strategies
+
+Standalone problems use a prepared strategy. Construction stays
+with the backend, and the result is the nonce itself. With `blake3` enabled:
+
+```rust
+use spongefish_pow::{blake3::Blake3PoW, PoWGrinder};
+
+let mut grinder = PoWGrinder::new(Blake3PoW::new([7; 32], 8));
+let nonce = grinder.grind().unwrap(); // Always sequential.
+assert!(grinder.verify(nonce));
+
+// With the parallel feature: same problem and least nonce, independent jobs.
+#[cfg(feature = "parallel")]
+assert_eq!(grinder.grind_parallel(), Some(nonce));
+```
+
+`KeccakPoW::new(seed, bits)` is interchangeable at the grinder boundary.

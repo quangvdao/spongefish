@@ -163,7 +163,7 @@ It is possible to augment the bits of soundnes with a proof of work using `spong
 
 ```rust
 use spongefish::{Argument, Narg, Transcript, VerificationError, Witness};
-use spongefish_pow::{blake3::Blake3PoW, PowTranscriptExt};
+use spongefish_pow::PowTranscriptExt;
 
 /// A challenge the prover pays `BITS` bits of work for.
 struct GrindingArgumentExample<const BITS: u32>;
@@ -178,18 +178,19 @@ impl<const BITS: u32> Argument for GrindingArgumentExample<BITS> {
         _instance: &[u8; 32],
         _witness: Witness<&()>,
     ) -> Result<u64, VerificationError> {
-        transcript.verifier_message_pow::<u64, Blake3PoW>(f64::from(BITS))
+        transcript.sponge_pow(BITS)?;
+        Ok(transcript.verifier_message())
     }
 }
 
 let tag = b"example-v00/grind-16";
 let instance = [7u8; 32];
 let (narg, challenge) = Narg::prove::<GrindingArgumentExample<16>>(tag, &instance, &()).unwrap();
-assert_eq!(narg.len(), 8); // one u64 nonce
+assert!((1..=4).contains(&narg.len())); // compact nonce at 16 bits
 assert_eq!(Narg::verify::<GrindingArgumentExample<16>>(tag, &instance, &narg).unwrap(), challenge);
 ```
 
-`verifier_message_pow` internally squeezes a grinding seed, has the prover search for a nonce solving the grinding problem, then sends the nonce as a prover message, and returns a new verifier message. A Keccak strategy is available too, and the `parallel` feature will use multi-threading the search across threads.
+`sponge_pow` searches for a compact nonce whose transcript output has `BITS` low zero bits, sends it as a prover message, and checks it. The verifier messages immediately following the step are protected. Difficulty is an integer from 0 to 25. Standalone BLAKE3 and Keccak problems are constructed by their backends and searched through `PoWGrinder`; sequential and parallel execution are selected explicitly.
 
 ## Also in the box
 
