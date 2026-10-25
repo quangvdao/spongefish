@@ -10,9 +10,9 @@ It has not been reviewed, and should be considered a proof-of-concept example th
 
 ## Wiring into a NARG
 
-The `PowTranscriptExt` extension adds a proof-of-work step to every `Transcript`. It works both inside a generic `Argument::run` and directly on `ProverState` and `VerifierState`. The step returns `Result<(), VerificationError>`; callers then obtain the protected verifier message. The standalone `PoWGrinder` and convenience functions remain available for other integrations.
+The `PowTranscriptExt` extension adds a proof-of-work step to every `Transcript`. It works both inside a generic `Argument::run` and directly on `ProverState` and `VerifierState`. Both sides return `Result<T, VerificationError>`. The standalone `PoWGrinder` and convenience functions remain available for other integrations.
 
-Both parties exchange a compact nonce and check bytes squeezed from the public duplex sponge. The caller then draws the protected verifier message. A rejected or truncated nonce poisons the verifier. Generic transcript search is sequential even with `parallel`; standalone prepared strategies still provide explicit parallel execution.
+Both parties execute the same protocol: exchange a compact nonce, check bytes squeezed from the public duplex sponge, then obtain the protected verifier message. `Transcript::search_verifier_message` provides a prover-only evaluator, so the verifier skips the nonce search. A rejected or truncated nonce poisons the verifier. Generic `verifier_message_pow` is always sequential, including inside `Argument::run` and `Narg::prove`. The `parallel` feature adds `verifier_message_pow_parallel(&mut prover, bits)` for concrete provers with a `Send` public duplex sponge. It produces the same least nonce, proof and challenge, so verification still uses the generic method. Ordinary proving, private RNGs and verification require neither `Send` nor `Sync`. The feature is enabled by default; it does not change generic search behavior.
 
 Use the default features of `spongefish` and `spongefish-pow` for this example:
 
@@ -28,13 +28,11 @@ fn main() -> Result<(), VerificationError> {
     let instance = 0u32;
 
     let mut prover = ProverState::<DefaultHash>::new(&session_id, &instance);
-    prover.sponge_pow(POW_BITS)?;
-    let challenge = prover.verifier_message::<u32>();
+    let challenge = prover.verifier_message_pow::<u32>(POW_BITS)?;
     let proof = prover.into_narg_string();
 
     let mut verifier = VerifierState::<DefaultHash>::new(&session_id, &instance, &proof);
-    verifier.sponge_pow(POW_BITS)?;
-    let replay = verifier.verifier_message::<u32>();
+    let replay = verifier.verifier_message_pow::<u32>(POW_BITS)?;
     assert_eq!(challenge, replay);
     verifier.check_eof()
 }
@@ -57,17 +55,18 @@ impl Argument for PowRound {
         _instance: &u32,
         _witness: Witness<&()>,
     ) -> Result<u32, VerificationError> {
-        transcript.sponge_pow(8)?;
-        Ok(transcript.verifier_message())
+        transcript.verifier_message_pow::<u32>(8)
     }
 }
 ```
 
-The nonce is canonical LEB128 below `2^(bits + 7)`, with integer difficulty at most 25. The sponge backend, difficulty, placement of the step, and protected message type must be fixed by the protocol and accounted for in its session tag. The example uses a cheap difficulty for demonstration; the appropriate work factor and soundness benefit depend on the protocol.
+Difficulty is an integer from 0 to 57. The nonce is encoded as canonical LEB128 below `2^(bits + 7)`; at zero difficulty no nonce or check bytes are used. The duplex sponge backend, difficulty, placement of the step, and returned message type must be fixed by the protocol and accounted for in its session tag. The example uses a cheap difficulty for demonstration; the appropriate work factor and soundness benefit depend on the protocol.
+
+All PoW APIs take difficulty as `u32` and use `u64` nonces. Standalone seeded strategies accept 0 through 59 bits; fused grinding stops at 57 bits to reserve 128 times the expected trials in its nonce space.
 
 ## Prepared strategies
 
-Standalone problems use a prepared strategy. Construction stays
+Seeded and duplex sponge predicates use the same grinder contract. Construction stays
 with the backend, and the result is the nonce itself. With `blake3` enabled:
 
 ```rust
@@ -83,3 +82,5 @@ assert_eq!(grinder.grind_parallel(), Some(nonce));
 ```
 
 `KeccakPoW::new(seed, bits)` is interchangeable at the grinder boundary.
+Fused PoW prepares a strategy from the evaluator instead of a seed; the
+`Transcript` extension handles nonce encoding and challenge generation.

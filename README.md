@@ -178,8 +178,7 @@ impl<const BITS: u32> Argument for GrindingArgumentExample<BITS> {
         _instance: &[u8; 32],
         _witness: Witness<&()>,
     ) -> Result<u64, VerificationError> {
-        transcript.sponge_pow(BITS)?;
-        Ok(transcript.verifier_message())
+        transcript.verifier_message_pow(BITS)
     }
 }
 
@@ -190,7 +189,7 @@ assert!((1..=4).contains(&narg.len())); // compact nonce at 16 bits
 assert_eq!(Narg::verify::<GrindingArgumentExample<16>>(tag, &instance, &narg).unwrap(), challenge);
 ```
 
-`sponge_pow` searches for a compact nonce whose transcript output has `BITS` low zero bits, sends it as a prover message, and checks it. The verifier messages immediately following the step are protected. Difficulty is an integer from 0 to 25. Standalone BLAKE3 and Keccak problems are constructed by their backends and searched through `PoWGrinder`; sequential and parallel execution are selected explicitly.
+`verifier_message_pow` searches for a compact nonce whose duplex sponge output has `BITS` low zero bits, sends it as a prover message, checks it, then returns the protected verifier message. Difficulty is an integer from 0 to 57; at zero there is no nonce or check. This generic method is always sequential. The `spongefish-pow/parallel` feature also provides `verifier_message_pow_parallel(&mut prover, BITS)` for concrete provers with a `Send` public duplex sponge. Ordinary proving, private RNGs and verification require neither `Send` nor `Sync`. Standalone BLAKE3 and Keccak grinders remain available for other integrations.
 
 ## Also in the box
 
