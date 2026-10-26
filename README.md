@@ -189,7 +189,7 @@ assert!((1..=4).contains(&narg.len())); // compact nonce at 16 bits
 assert_eq!(Narg::verify::<GrindingArgumentExample<16>>(tag, &instance, &narg).unwrap(), challenge);
 ```
 
-`verifier_message_pow` searches for a compact nonce whose duplex sponge output has `BITS` low zero bits, sends it as a prover message, checks it, then returns the protected verifier message. Difficulty is an integer from 0 to 57; at zero there is no nonce or check. This generic method is always sequential. The `spongefish-pow/parallel` feature also provides `verifier_message_pow_parallel(&mut prover, BITS)` for concrete provers with a `Send` public duplex sponge. Ordinary proving, private RNGs and verification require neither `Send` nor `Sync`. Standalone BLAKE3 and Keccak grinders remain available for other integrations.
+`verifier_message_pow` searches for a compact nonce whose duplex sponge output has `BITS` low zero bits, sends it as a prover message, checks it, then returns the protected verifier message. Difficulty is an integer from 0 to 57; at zero there is no nonce or check. This generic method is always sequential and uses no SIMD, so grinding inside `Argument::run` is slower than the parallel BLAKE3 search of `v0.8.0` at the same difficulty (about 35 times fewer trials per second in one measurement on a 10-core machine). The `spongefish-pow/parallel` feature also provides `verifier_message_pow_parallel(&mut prover, BITS)` for concrete provers with a `Send` public duplex sponge. Ordinary proving, private RNGs and verification require neither `Send` nor `Sync`. Standalone BLAKE3 and Keccak grinders remain available for other integrations.
 
 ## Also in the box
 

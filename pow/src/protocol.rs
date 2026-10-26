@@ -75,9 +75,10 @@ pub trait PowTranscriptExt: Transcript {
     /// byte, with probability `1 - (1 - 2^-bits)^128`: at least `1 - e^-8` for
     /// `bits <= 4`. The nonce space holds `2^7` times the expected number of
     /// trials, so for an ideal duplex sponge an honest search fails with probability
-    /// at most `e^-128`. This method always searches sequentially. The `parallel`
-    /// feature provides `verifier_message_pow_parallel` for concrete provers;
-    /// both paths return the same least nonce and produce identical proofs.
+    /// at most `e^-128`. This method always searches sequentially (see
+    /// *Prover performance*). The `parallel` feature provides
+    /// `verifier_message_pow_parallel` for concrete provers; both paths return
+    /// the same least nonce and produce identical proofs.
     ///
     /// # Security
     ///
@@ -101,6 +102,29 @@ pub trait PowTranscriptExt: Transcript {
     /// rate block, each search trial costs one permutation call and the
     /// verifier needs one permutation after the nonce. Other alignments, longer
     /// outputs and other backends can cost more.
+    ///
+    /// # Prover performance
+    ///
+    /// The search runs on the calling thread, one candidate at a time, with the
+    /// backend's scalar duplex sponge: each trial clones the public sponge,
+    /// absorbs the nonce and squeezes the check bytes. In `v0.8.0`, this
+    /// method searched a separate BLAKE3 or Keccak hash on all Rayon threads,
+    /// with SIMD batches for BLAKE3. At the same difficulty, grinding through
+    /// this method, including inside [`Argument::run`](spongefish::Argument::run)
+    /// and the [`FiatShamir`](spongefish::FiatShamir) prover, is therefore
+    /// slower. In one measurement at 20 bits with `DefaultHash` on a 10-core
+    /// machine, this method ran about 35 times fewer trials per second than
+    /// the `v0.8.0` BLAKE3 search, and `verifier_message_pow_parallel` about 6
+    /// times fewer.
+    ///
+    /// This method cannot dispatch to the parallel search. Parallel jobs need
+    /// a `Send` evaluator, and [`Transcript::search_verifier_message`] does not
+    /// promise one, so that [`ProverState`](spongefish::ProverState) keeps
+    /// accepting duplex sponges that are not `Send`. Lifting this limitation
+    /// needs a `Send` bound on that evaluator, and hence on the public duplex
+    /// sponge of every prover, or a new hook on [`Transcript`]. Code that holds
+    /// a concrete `ProverState` with a `Send` public sponge can call
+    /// `verifier_message_pow_parallel` instead; it writes the same proof.
     ///
     /// # Errors
     ///
