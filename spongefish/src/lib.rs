@@ -73,8 +73,12 @@
 //! Encodings implement the trait [`Encoding<U>`][Encoding] and map the message
 //! into the duplex sponge alphabet.
 //! Its output is what the sponge absorbs (the map `φ` of [[CO25]]).
-//! The default unit of encodings is `Encoding<u8>`, and is also used for the byte serialization
-//! of the NARG string.
+//! The default unit of encodings is `Encoding<u8>`.
+//!
+//! The trait [`ToNarg`] writes a prover message into the NARG string. By default it writes the
+//! `Encoding<u8>` bytes, so on a byte sponge the absorbed form and the wire form coincide; a type
+//! can override it to send a different wire form, such as a variable-length integer that is
+//! absorbed as a fixed-width word.
 //!
 //! Decoding maps are implemented via the trait [`FromUniform<U>`][FromUniform] and map
 //! the duplex sponge output into a verifier message.
@@ -90,7 +94,7 @@
 //! The [`Argument`] API allows to define an interactive argument.
 //!
 //! On a sponge over a field `F`, a message type carries two implementations,
-//! `Encoding<F>` for the sponge and `Encoding` for the NARG string. They need
+//! `Encoding<F>` for the sponge and [`ToNarg`] for the NARG string. They need
 //! not resemble each other, but each must be prefix-free over its own
 //! alphabet. The verifier deserializes the bytes and then absorbs the
 //! message's `Encoding<F>` ([`VerifierState::prover_message`]). The instance
@@ -206,11 +210,11 @@ pub use duplex_sponge::{
 };
 pub use error::VerificationError;
 pub use narg_prover::ProverState;
-pub use narg_string::{FromNarg, NargReader};
+pub use narg_string::{FromNarg, NargReader, ToNarg};
 pub use narg_verifier::VerifierState;
 pub use private_rng::PrivateRng;
 #[cfg(feature = "derive")]
-pub use spongefish_derive::{Codec, Encoding, FromNarg, FromUniform, Unit};
+pub use spongefish_derive::{Codec, Encoding, FromNarg, FromUniform, ToNarg, Unit};
 
 /// The default hash function provided by the library: the TurboSHAKE128
 /// duplex sponge of draft-irtf-cfrg-fiat-shamir.

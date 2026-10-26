@@ -4,7 +4,7 @@
 //! over the field of size `P = 2^31-1`.
 
 use spongefish::{
-    Argument, ByteArray, Encoding, FromNarg, FromUniform, Narg, NargReader, Transcript,
+    Argument, ByteArray, Encoding, FromNarg, FromUniform, Narg, NargReader, ToNarg, Transcript,
     VerificationError, Witness,
 };
 
@@ -30,6 +30,8 @@ impl Encoding for M31 {
         self.0.to_le_bytes()
     }
 }
+
+impl ToNarg for M31 {}
 
 impl FromNarg for M31 {
     fn from_narg(reader: &mut NargReader<'_>) -> Result<Self, VerificationError> {

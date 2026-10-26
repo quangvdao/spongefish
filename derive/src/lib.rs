@@ -279,6 +279,34 @@ fn generate_from_narg_impl(input: &DeriveInput) -> Result<TokenStream2> {
     ))
 }
 
+fn generate_to_narg_impl(input: &DeriveInput) -> Result<TokenStream2> {
+    let fields = struct_fields(input, "ToNarg")?;
+    let bounded = bounded_types(&fields);
+
+    let field_writes = fields.iter().filter(|field| !field.skip).map(|field| {
+        let member = &field.member;
+        quote! {
+            ::spongefish::ToNarg::to_narg(&self.#member, narg);
+        }
+    });
+
+    let trait_path = quote!(::spongefish::ToNarg);
+    Ok(impl_block(
+        input,
+        &trait_path,
+        &bounded,
+        &[],
+        &quote! {
+            fn to_narg(&self, narg: &mut ::spongefish::__private::Vec<u8>) {
+                // A unit struct, or one whose every field is skipped,
+                // writes nothing at all.
+                let _ = &narg;
+                #(#field_writes)*
+            }
+        },
+    ))
+}
+
 fn generate_unit_impl(input: &DeriveInput) -> Result<TokenStream2> {
     let fields = struct_fields(input, "Unit")?;
     let bounded = bounded_types(&fields);
@@ -365,9 +393,22 @@ pub fn derive_from_narg(input: TokenStream) -> TokenStream {
     expand(generate_from_narg_impl(&input))
 }
 
+/// Derive macro for the [`ToNarg`](https://docs.rs/spongefish/latest/spongefish/trait.ToNarg.html) trait.
+///
+/// Generate an implementation that serializes struct fields sequentially into the NARG string,
+/// each with its own [`ToNarg`](https://docs.rs/spongefish/latest/spongefish/trait.ToNarg.html).
+/// Fields can be skipped using `#[spongefish(skip)]`. The struct must also implement
+/// [`Encoding`](https://docs.rs/spongefish/latest/spongefish/trait.Encoding.html).
+#[proc_macro_derive(ToNarg, attributes(spongefish))]
+pub fn derive_to_narg(input: TokenStream) -> TokenStream {
+    let input = parse_macro_input!(input as DeriveInput);
+    expand(generate_to_narg_impl(&input))
+}
+
 /// Derive macro that generates [`Encoding`](https://docs.rs/spongefish/latest/spongefish/trait.Encoding.html),
-/// [`FromUniform`](https://docs.rs/spongefish/latest/spongefish/trait.FromUniform.html), and
-/// [`FromNarg`](https://docs.rs/spongefish/latest/spongefish/trait.FromNarg.html) in one go.
+/// [`FromUniform`](https://docs.rs/spongefish/latest/spongefish/trait.FromUniform.html),
+/// [`FromNarg`](https://docs.rs/spongefish/latest/spongefish/trait.FromNarg.html), and
+/// [`ToNarg`](https://docs.rs/spongefish/latest/spongefish/trait.ToNarg.html) in one go.
 #[proc_macro_derive(Codec, attributes(spongefish))]
 pub fn derive_codec(input: TokenStream) -> TokenStream {
     let input = parse_macro_input!(input as DeriveInput);
@@ -375,10 +416,12 @@ pub fn derive_codec(input: TokenStream) -> TokenStream {
         let encoding = generate_encoding_impl(&input)?;
         let from_uniform = generate_from_uniform_impl(&input)?;
         let from_narg = generate_from_narg_impl(&input)?;
+        let to_narg = generate_to_narg_impl(&input)?;
         Ok(quote! {
             #encoding
             #from_uniform
             #from_narg
+            #to_narg
         })
     })())
 }

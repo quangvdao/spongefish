@@ -4,7 +4,7 @@ use core::fmt;
 #[cfg(feature = "turboshake128")]
 use crate::DefaultHash;
 use crate::{
-    DuplexSpongeInterface, Encoding, FromNarg, FromUniform, NargReader, SessionId,
+    DuplexSpongeInterface, Encoding, FromNarg, FromUniform, NargReader, SessionId, ToNarg,
     VerificationError,
 };
 
@@ -349,6 +349,26 @@ impl<H> VerifierState<'_, H>
 where
     H: DuplexSpongeInterface<U = u8>,
 {
+    /// Read a prover message, reject it unless it serializes back to the bytes
+    /// read, then absorb its [`Encoding`].
+    ///
+    /// The dual of [`ProverState::prover_message`][crate::ProverState::prover_message]
+    /// on a byte sponge, used by the [`Transcript`][crate::Transcript]
+    /// verifier. The round trip pins each message to one serialization, so the
+    /// absorbed form may differ from the wire form without making the NARG
+    /// string malleable. On failure nothing is absorbed and the state is
+    /// poisoned.
+    pub(crate) fn prover_message_canonical<T: ToNarg + FromNarg>(
+        &mut self,
+    ) -> Result<T, VerificationError> {
+        let (message, bytes) = self.read_message(T::from_narg)?;
+        let mut narg = Vec::with_capacity(bytes.len());
+        message.to_narg(&mut narg);
+        self.reader.check(|| narg == bytes)?;
+        self.duplex_sponge_state.absorb(message.encode().as_ref());
+        Ok(message)
+    }
+
     /// Read a prover message with a deserialization closure.
     ///
     /// The prover message is fed (absorbed) into the duplex sponge `H` within this function call.

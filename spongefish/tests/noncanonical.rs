@@ -4,7 +4,7 @@
 //! we lose a soundness property called simulation extractability (as well as universal composability).
 //! This file provides one such example that **should NOT** be reproduced.
 use spongefish::{
-    Argument, ByteArray, Encoding, FromNarg, FromUniform, Narg, NargReader, Transcript,
+    Argument, ByteArray, Encoding, FromNarg, FromUniform, Narg, NargReader, ToNarg, Transcript,
     VerificationError, Witness,
 };
 
@@ -21,6 +21,8 @@ impl Encoding for Elem {
         self.0.to_le_bytes()
     }
 }
+
+impl ToNarg for Elem {}
 
 impl FromNarg for Elem {
     fn from_narg(reader: &mut NargReader<'_>) -> Result<Self, VerificationError> {
@@ -86,7 +88,7 @@ fn a_second_encoding_of_the_same_message_is_rejected() {
 
     assert!(
         Narg::verify_with_session_id::<Toy>(&sid, &instance, &mauled).is_err(),
-        "a second accepting NARG string exists for one statement: the verifier absorbed a \
-         re-encoding of what it parsed instead of the bytes it read"
+        "a second accepting NARG string exists for one statement: the verifier accepted a \
+         message that does not serialize back to the bytes it read"
     );
 }

@@ -4,7 +4,7 @@ use core::marker::PhantomData;
 #[cfg(feature = "turboshake128")]
 use crate::DefaultHash;
 use crate::{
-    DuplexSpongeInit, DuplexSpongeInterface, Encoding, FromNarg, FromUniform, ProverState,
+    DuplexSpongeInit, DuplexSpongeInterface, Encoding, FromNarg, FromUniform, ProverState, ToNarg,
     VerificationError, VerifierState,
 };
 
@@ -165,7 +165,7 @@ pub trait Transcript {
     /// read by the verifier.
     fn prover_message<T>(&mut self, value: Witness<T>) -> Result<T, VerificationError>
     where
-        T: Encoding + FromNarg;
+        T: ToNarg + FromNarg;
 
     /// Declare a verifier message, sent by the verifier to the prover.
     ///
@@ -370,7 +370,7 @@ impl<H: DuplexSpongeInterface<U = u8>, R: DuplexSpongeInit<U = u8>> Transcript
 {
     fn prover_message<T>(&mut self, value: Witness<T>) -> Result<T, VerificationError>
     where
-        T: Encoding + FromNarg,
+        T: ToNarg + FromNarg,
     {
         // `Witness::unknown()` here fails with `VerificationError`.
         let Witness(value) = value;
@@ -415,13 +415,14 @@ impl<H: DuplexSpongeInterface<U = u8>, R: DuplexSpongeInit<U = u8>> Transcript
 impl<H: DuplexSpongeInterface<U = u8>> Transcript for VerifierState<'_, H> {
     fn prover_message<T>(&mut self, _value: Witness<T>) -> Result<T, VerificationError>
     where
-        T: Encoding + FromNarg,
+        T: ToNarg + FromNarg,
     {
         // The argument is `unknown` and is dropped; the message comes off the
-        // wire. Absorbing the bytes read rather than a re-encoding of what was
-        // parsed is what keeps a non-canonical codec from admitting a second
-        // accepting proof.
-        Self::prover_message_as(self, T::from_narg)
+        // wire. The absorbed form may differ from the wire form, so a parsed
+        // message is accepted only if it serializes back to the bytes read:
+        // that keeps a non-canonical codec from admitting a second accepting
+        // proof.
+        Self::prover_message_canonical(self)
     }
 
     fn verifier_message<T: FromUniform>(&mut self) -> T {

@@ -31,13 +31,17 @@ use crate::Unit;
 ///
 /// A skipped field will not be absorbed by the duplex sponge, nor serialized
 /// into the NARG string.
-pub trait Codec<U: Unit = u8>: Encoding + Encoding<U> + FromUniform<U> + crate::FromNarg {}
+pub trait Codec<U: Unit = u8>:
+    Encoding + Encoding<U> + FromUniform<U> + crate::FromNarg + crate::ToNarg
+{
+}
 
 /// Map into string over the [`Unit`] of the sponge.
 ///
 /// `Encoding` maps allow to define, for a struct, how they should be serialized into the NARG string.
 ///
-/// The encoding map over bytes, implemented via `Encoding<u8>` will be used also for serializing into a NARG string.
+/// The encoding map over bytes, implemented via `Encoding<u8>`, is also the default NARG serialization;
+/// see [`ToNarg`](crate::ToNarg).
 /// See [Messages and codecs](crate#messages-and-codecs).
 ///
 /// # Security
@@ -235,6 +239,12 @@ macro_rules! impl_tuple_encoding {
                 output
             }
         }
+
+        impl<$($param: crate::ToNarg),+> crate::ToNarg for ($($param,)+) {
+            fn to_narg(&self, narg: &mut Vec<u8>) {
+                $(self.$index.to_narg(narg);)+
+            }
+        }
     )*};
 }
 
@@ -332,6 +342,29 @@ impl<T: Encoding> Encoding for LengthPrefixed<Vec<T>> {
     }
 }
 
+fn length_prefixed_to_narg<T: crate::ToNarg>(elements: &[T], narg: &mut Vec<u8>) {
+    let len: u32 = elements
+        .len()
+        .try_into()
+        .expect("length-prefixed encoding requires the element count to fit in u32");
+    narg.extend_from_slice(&len.to_le_bytes());
+    for element in elements {
+        element.to_narg(narg);
+    }
+}
+
+impl<T: crate::ToNarg> crate::ToNarg for LengthPrefixed<&[T]> {
+    fn to_narg(&self, narg: &mut Vec<u8>) {
+        length_prefixed_to_narg(self.0, narg);
+    }
+}
+
+impl<T: crate::ToNarg> crate::ToNarg for LengthPrefixed<Vec<T>> {
+    fn to_narg(&self, narg: &mut Vec<u8>) {
+        length_prefixed_to_narg(&self.0, narg);
+    }
+}
+
 impl<T: crate::FromNarg> crate::FromNarg for LengthPrefixed<Vec<T>> {
     /// The deserialization function for a length-prefixed deserializable vector.
     ///
@@ -345,7 +378,10 @@ impl<T: crate::FromNarg> crate::FromNarg for LengthPrefixed<Vec<T>> {
 
 /// Blanket implementation of [`Codec`] for all types implementing
 /// [`FromNarg`][`crate::FromNarg`], [`Encoding`], and [`FromUniform`].
-impl<U: Unit, E> Codec<U> for E where E: Encoding + Encoding<U> + FromUniform<U> + crate::FromNarg {}
+impl<U: Unit, E> Codec<U> for E where
+    E: Encoding + Encoding<U> + FromUniform<U> + crate::FromNarg + crate::ToNarg
+{
+}
 
 #[cfg(test)]
 mod tests {

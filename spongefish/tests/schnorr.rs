@@ -6,7 +6,7 @@ use curve25519_dalek::{
     scalar::Scalar,
 };
 use spongefish::{
-    Argument, ByteArray, Encoding, FromNarg, FromUniform, Narg, NargReader, Transcript,
+    Argument, ByteArray, Encoding, FromNarg, FromUniform, Narg, NargReader, ToNarg, Transcript,
     VerificationError, Witness,
 };
 
@@ -41,6 +41,8 @@ impl Encoding for Point {
         self.0.compress().to_bytes()
     }
 }
+impl ToNarg for Point {}
+
 impl FromNarg for Point {
     fn from_narg(r: &mut NargReader<'_>) -> Result<Self, VerificationError> {
         CompressedRistretto(r.take_array::<32>()?)
@@ -61,6 +63,8 @@ impl Encoding for Fr {
         self.0.to_bytes()
     }
 }
+impl ToNarg for Fr {}
+
 impl FromNarg for Fr {
     fn from_narg(r: &mut NargReader<'_>) -> Result<Self, VerificationError> {
         let bytes = r.take_array::<32>()?;

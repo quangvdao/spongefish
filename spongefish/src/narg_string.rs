@@ -1,7 +1,7 @@
 use alloc::vec::Vec;
 use core::cell::Cell;
 
-use crate::VerificationError;
+use crate::{Encoding, VerificationError};
 
 /// A forward-only cursor over a NARG string.
 ///
@@ -272,6 +272,66 @@ pub trait FromNarg: Sized {
         Ok(parsed.map(|element| element.unwrap_or_else(|| unreachable!("checked above"))))
     }
 }
+
+/// Serialization of a prover message into the NARG string: the dual of [`FromNarg`].
+///
+/// A prover message has two forms. [`Encoding`] is what the duplex sponge
+/// absorbs; [`ToNarg`] is what the NARG string carries. The provided method
+/// writes the [`Encoding<u8>`] bytes, so by default the two coincide, and
+/// most types implement this trait with an empty body:
+///
+/// ```
+/// # use spongefish::{Encoding, ToNarg};
+/// struct Point([u8; 32]);
+/// impl Encoding for Point {
+///     fn encode(&self) -> impl AsRef<[u8]> {
+///         self.0
+///     }
+/// }
+/// impl ToNarg for Point {}
+/// ```
+///
+/// Override [`ToNarg::to_narg`] only when the wire form should differ from the
+/// absorbed form, for example a compact variable-length integer that is
+/// absorbed as a fixed-width word.
+///
+/// # Security
+///
+/// [`FromNarg::from_narg`] must invert this map: it reads exactly the bytes
+/// [`ToNarg::to_narg`] wrote and returns the same value. The
+/// [`Transcript`](crate::Transcript) verifier serializes every parsed prover
+/// message again and rejects it unless the result equals the bytes it read, so
+/// each message has exactly one accepted serialization, even when the absorbed
+/// form differs from the wire form.
+pub trait ToNarg: Encoding {
+    /// Append the NARG serialization of `self` to `narg`.
+    fn to_narg(&self, narg: &mut Vec<u8>) {
+        narg.extend_from_slice(self.encode().as_ref());
+    }
+}
+
+impl<T: ToNarg + ?Sized> ToNarg for &T {
+    fn to_narg(&self, narg: &mut Vec<u8>) {
+        (**self).to_narg(narg);
+    }
+}
+
+/// Arrays serialize as the concatenation of their elements' serializations.
+impl<T: ToNarg, const N: usize> ToNarg for [T; N] {
+    fn to_narg(&self, narg: &mut Vec<u8>) {
+        for element in self {
+            element.to_narg(narg);
+        }
+    }
+}
+
+impl ToNarg for u8 {}
+impl ToNarg for u16 {}
+impl ToNarg for u32 {}
+impl ToNarg for u64 {}
+impl ToNarg for u128 {}
+impl ToNarg for str {}
+impl ToNarg for alloc::string::String {}
 
 impl<const N: usize, T: FromNarg> FromNarg for [T; N] {
     fn from_narg(reader: &mut NargReader<'_>) -> Result<Self, VerificationError> {

@@ -5,7 +5,7 @@ use core::fmt;
 use crate::DefaultHash;
 use crate::{
     duplex_sponge::DuplexSpongeInit, DuplexSpongeInterface, Encoding, FromUniform, PrivateRng,
-    SessionId,
+    SessionId, ToNarg,
 };
 
 /// [`ProverState`] is the prover state in the non-interactive transformation.
@@ -202,22 +202,20 @@ where
     /// Input a prover message of type `T` into the Fiat-Shamir transformation.
     ///
     /// `T` must implement [`Encoding<H::U>`][`Encoding`] to be encoded in the domain of the
-    /// duplex sponge, and [`Encoding`] to be serialized into the NARG string.
+    /// duplex sponge, and [`ToNarg`] to be serialized into the NARG string.
     ///
-    pub fn prover_message<T: Encoding<H::U> + Encoding + ?Sized>(&mut self, message: &T) {
+    pub fn prover_message<T: Encoding<H::U> + ToNarg + ?Sized>(&mut self, message: &T) {
         self.duplex_sponge_state
             .absorb(<T as Encoding<H::U>>::encode(message).as_ref());
-        self.narg_string
-            .extend_from_slice(<T as Encoding>::encode(message).as_ref());
+        message.to_narg(&mut self.narg_string);
     }
 
     /// Input the last prover message and return the NARG string.
     ///
     /// Like [`ProverState::prover_message`], but consumes the prover state and returns the
     /// NARG string. The last prover message is not absorbed by the duplex sponge.
-    pub fn last_prover_message<T: Encoding + ?Sized>(mut self, message: &T) -> Vec<u8> {
-        self.narg_string
-            .extend_from_slice(<T as Encoding>::encode(message).as_ref());
+    pub fn last_prover_message<T: ToNarg + ?Sized>(mut self, message: &T) -> Vec<u8> {
+        message.to_narg(&mut self.narg_string);
         self.narg_string
     }
 
@@ -287,7 +285,7 @@ where
     /// Therefore, the number of elements sent must be fixed by the protocol or derived from the instance,
     /// never from prover-controlled data. For variable-length data, send a [`LengthPrefixed`][crate::LengthPrefixed]
     /// sequence instead.
-    pub fn prover_messages<T: Encoding<H::U> + Encoding>(&mut self, messages: &[T]) {
+    pub fn prover_messages<T: Encoding<H::U> + ToNarg>(&mut self, messages: &[T]) {
         for message in messages {
             self.prover_message(message);
         }
@@ -302,7 +300,7 @@ where
     pub fn prover_messages_iter<J>(&mut self, messages: J)
     where
         J: IntoIterator,
-        J::Item: Encoding<H::U> + Encoding,
+        J::Item: Encoding<H::U> + ToNarg,
     {
         messages
             .into_iter()

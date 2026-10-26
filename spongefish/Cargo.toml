@@ -56,6 +56,10 @@ sha2 = { workspace = true }
 workspace = true
 
 [[test]]
+name = "narg_form"
+required-features = ["derive", "getrandom", "turboshake128"]
+
+[[test]]
 name = "noncanonical"
 required-features = ["getrandom", "turboshake128"]
 
