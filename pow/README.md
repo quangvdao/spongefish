@@ -60,7 +60,7 @@ impl Argument for PowRound {
 }
 ```
 
-Difficulty is an integer from 0 to 57. The nonce is encoded as canonical LEB128 below `2^(bits + 7)`; at zero difficulty no nonce or check bytes are used. The duplex sponge backend, difficulty, placement of the step, and returned message type must be fixed by the protocol and accounted for in its session tag. The example uses a cheap difficulty for demonstration; the appropriate work factor and soundness benefit depend on the protocol.
+Difficulty is an integer from 0 to 57. The nonce is encoded as canonical LEB128 below `2^(bits + 7)`; at zero difficulty no nonce or check bytes are used. By default the duplex sponge absorbs those LEB128 bytes and squeezes `ceil(bits / 8)` check bytes. `verifier_message_pow_with::<N, T>` takes the nonce codec `N: PowCodec` as a parameter: `WordNonce` absorbs the nonce as a little-endian `u64` word and squeezes 8 check bytes, for transcripts that keep every absorb and squeeze a multiple of 8 bytes. A protocol can also implement `PowCodec` itself. The duplex sponge backend, difficulty, placement of the step, and returned message type must be fixed by the protocol and accounted for in its session tag. The example uses a cheap difficulty for demonstration; the appropriate work factor and soundness benefit depend on the protocol.
 
 All PoW APIs take difficulty as `u32` and use `u64` nonces. Standalone seeded strategies accept 0 through 59 bits; fused grinding stops at 57 bits to reserve 128 times the expected trials in its nonce space.
 

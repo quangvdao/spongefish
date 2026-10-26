@@ -1,8 +1,12 @@
 //! An interactive proof-of-work step shared by every `Transcript` implementation.
 
+use core::marker::PhantomData;
 #[cfg(feature = "parallel")]
 use spongefish::{DuplexSpongeInit, DuplexSpongeInterface, ProverState};
-use spongefish::{FromUniform, Transcript, VerificationError, Witness};
+
+use spongefish::{
+    Encoding, FromNarg, FromUniform, NargReader, ToNarg, Transcript, VerificationError, Witness,
+};
 
 use crate::{PoWGrinder, PowStrategy};
 
@@ -62,10 +66,14 @@ pub trait PowTranscriptExt: Transcript {
     /// For `bits > 0`, the prover sends a nonce below `2^(bits + 7)` as
     /// canonical LEB128: seven bits per byte, least significant first, the
     /// high bit set on every byte but the last, and no trailing zero byte. Both
-    /// parties then squeeze `ceil(bits / 8)` bytes and accept the nonce iff
-    /// their low `bits` bits are zero, then return the protected verifier
-    /// message. For `bits == 0`, it returns an ordinary verifier message without
-    /// a nonce or check bytes.
+    /// parties absorb those bytes, then squeeze `ceil(bits / 8)` bytes and
+    /// accept the nonce iff their low `bits` bits are zero, then return the
+    /// protected verifier message. For `bits == 0`, it returns an ordinary
+    /// verifier message without a nonce or check bytes.
+    ///
+    /// This is [`PowTranscriptExt::verifier_message_pow_with`] with
+    /// [`Leb128Nonce`]; pass another [`PowCodec`] to absorb the nonce or
+    /// squeeze the check differently.
     ///
     /// The returned message is protected, as are further verifier messages up to the
     /// next prover message. A type implementing [`FromUniform`] can bundle a
@@ -148,14 +156,46 @@ pub trait PowTranscriptExt: Transcript {
     /// Panics if `bits > 57`. Above that, a `u64` nonce no longer leaves `2^7`
     /// times the expected work.
     fn verifier_message_pow<T: FromUniform>(&mut self, bits: u32) -> Result<T, VerificationError> {
-        validate_bits(bits);
+        self.verifier_message_pow_with::<Leb128Nonce, T>(bits)
+    }
+
+    /// [`PowTranscriptExt::verifier_message_pow`] with the nonce codec `N`.
+    ///
+    /// The nonce is sent with `N`'s [`ToNarg`] and absorbed with its
+    /// [`Encoding`], and the check squeezes `N::check_len(bits)` bytes. The
+    /// value range, the acceptance rule, the search and the returned message
+    /// are as in [`PowTranscriptExt::verifier_message_pow`].
+    ///
+    /// ```
+    /// use spongefish::{DefaultHash, Narg, ProverState, VerifierState};
+    /// use spongefish_pow::{PowTranscriptExt, WordNonce};
+    ///
+    /// let session = Narg::derive_session_id(b"word-pow/v1");
+    /// let mut prover = ProverState::<DefaultHash>::new_with_seed(&session, &0u32, [7; 32]);
+    /// let challenge = prover.verifier_message_pow_with::<WordNonce, u64>(8)?;
+    /// let proof = prover.into_narg_string();
+    /// let mut verifier = VerifierState::<DefaultHash>::new(&session, &0u32, &proof);
+    /// assert_eq!(verifier.verifier_message_pow_with::<WordNonce, u64>(8)?, challenge);
+    /// verifier.check_eof()?;
+    /// # Ok::<(), spongefish::VerificationError>(())
+    /// ```
+    ///
+    /// # Panics
+    ///
+    /// Panics if `bits > 57`, or if `N::check_len(bits)` is not between
+    /// `ceil(bits / 8)` and 8.
+    fn verifier_message_pow_with<N: PowCodec, T: FromUniform>(
+        &mut self,
+        bits: u32,
+    ) -> Result<T, VerificationError> {
+        validate::<N>(bits);
         let nonce = if bits == 0 {
             Witness::unknown()
         } else {
             self.search_verifier_message()
-                .map(|evaluate| PoWGrinder::new(TranscriptPoW::new(evaluate, bits)).grind())
+                .map(|evaluate| PoWGrinder::new(TranscriptPoW::<_, N>::new(evaluate, bits)).grind())
         };
-        finish_pow(self, bits, nonce)
+        finish_pow::<N, T>(self, bits, nonce)
     }
 }
 
@@ -194,20 +234,38 @@ pub fn verifier_message_pow_parallel<T: FromUniform>(
     >,
     bits: u32,
 ) -> Result<T, VerificationError> {
-    validate_bits(bits);
+    verifier_message_pow_parallel_with::<Leb128Nonce, T>(prover, bits)
+}
+
+/// [`verifier_message_pow_parallel`] with the nonce codec `N`.
+///
+/// Available with `parallel`. It writes the same proof as
+/// [`PowTranscriptExt::verifier_message_pow_with`] with the same `N`.
+#[cfg(feature = "parallel")]
+pub fn verifier_message_pow_parallel_with<N: PowCodec, T: FromUniform>(
+    prover: &mut ProverState<
+        impl DuplexSpongeInterface<U = u8> + Send,
+        impl DuplexSpongeInit<U = u8>,
+    >,
+    bits: u32,
+) -> Result<T, VerificationError> {
+    validate::<N>(bits);
     let nonce = if bits == 0 {
         Witness::unknown()
     } else {
         Witness::known(
-            PoWGrinder::new(TranscriptPoW::new(prover.search_verifier_message(), bits))
-                .grind_parallel(),
+            PoWGrinder::new(TranscriptPoW::<_, N>::new(
+                prover.search_verifier_message(),
+                bits,
+            ))
+            .grind_parallel(),
         )
     };
-    finish_pow(prover, bits, nonce)
+    finish_pow::<N, T>(prover, bits, nonce)
 }
 
 // Both search paths share every proof-writing and verification operation.
-fn finish_pow<T: FromUniform>(
+fn finish_pow<N: PowCodec, T: FromUniform>(
     transcript: &mut (impl Transcript + ?Sized),
     bits: u32,
     nonce: Witness<Option<u64>>,
@@ -218,21 +276,11 @@ fn finish_pow<T: FromUniform>(
     }
     let nonce = nonce
         .map(|nonce| nonce.ok_or(VerificationError))
-        .transpose()?
-        .map(Leb128::new);
-    let mut value = 0u128;
-    let mut last = 0x80;
-    let mut len = 0;
-    while last & 0x80 != 0 && len < max_nonce_len(bits) {
-        last = transcript.prover_message(nonce.as_ref().map(|nonce| nonce.bytes[len]))?;
-        value |= u128::from(last & 0x7f) << (7 * len);
-        len += 1;
-    }
-    transcript.check(|| {
-        last & 0x80 == 0 && (len == 1 || last != 0) && value <= u128::from(last_nonce(bits))
-    })?;
+        .transpose()?;
+    let value = transcript.prover_message(nonce.map(N::new))?.value();
+    transcript.check(|| value <= last_nonce(bits))?;
     let mut word = [0u8; 8];
-    for byte in &mut word[..word_len(bits)] {
+    for byte in &mut word[..N::check_len(bits)] {
         *byte = transcript.verifier_message();
     }
     let accepted = accepts(bits, word);
@@ -250,16 +298,17 @@ fn finish_pow<T: FromUniform>(
 // Reserve 2^7 times the expected work in the u64 nonce space.
 const MAX_BITS: u32 = 57;
 
-fn validate_bits(bits: u32) {
+fn validate<N: PowCodec>(bits: u32) {
     assert!(bits <= MAX_BITS, "bits must be at most 57");
+    let len = N::check_len(bits);
+    assert!(
+        word_len(bits) <= len && len <= 8,
+        "PowCodec::check_len must be between ceil(bits / 8) and 8"
+    );
 }
 
 const fn last_nonce(bits: u32) -> u64 {
     u64::MAX >> (MAX_BITS - bits)
-}
-
-const fn max_nonce_len(bits: u32) -> usize {
-    (bits as usize + 13) / 7
 }
 
 const fn word_len(bits: u32) -> usize {
@@ -271,25 +320,39 @@ const fn accepts(bits: u32, word: [u8; 8]) -> bool {
 }
 
 /// A prepared duplex sponge strategy using the same grinder as seeded PoW.
-#[derive(Clone)]
-struct TranscriptPoW<E> {
+struct TranscriptPoW<E, N> {
     evaluate: E,
     bits: u32,
+    nonce: PhantomData<fn() -> N>,
 }
 
-impl<E> TranscriptPoW<E> {
-    fn new(evaluate: E, bits: u32) -> Self {
-        validate_bits(bits);
-        Self { evaluate, bits }
+impl<E: Clone, N> Clone for TranscriptPoW<E, N> {
+    fn clone(&self) -> Self {
+        Self {
+            evaluate: self.evaluate.clone(),
+            bits: self.bits,
+            nonce: PhantomData,
+        }
     }
 }
 
-impl<E: Fn(&[u8], &mut [u8]) + Clone> PowStrategy for TranscriptPoW<E> {
+impl<E, N: PowCodec> TranscriptPoW<E, N> {
+    fn new(evaluate: E, bits: u32) -> Self {
+        validate::<N>(bits);
+        Self {
+            evaluate,
+            bits,
+            nonce: PhantomData,
+        }
+    }
+}
+
+impl<E: Fn(&[u8], &mut [u8]) + Clone, N: PowCodec> PowStrategy for TranscriptPoW<E, N> {
     fn check(&mut self, nonce: u64) -> bool {
         let mut word = [0u8; 8];
         (self.evaluate)(
-            Leb128::new(nonce).as_bytes(),
-            &mut word[..word_len(self.bits)],
+            N::new(nonce).encode().as_ref(),
+            &mut word[..N::check_len(self.bits)],
         );
         accepts(self.bits, word)
     }
@@ -297,6 +360,130 @@ impl<E: Fn(&[u8], &mut [u8]) + Clone> PowStrategy for TranscriptPoW<E> {
     fn last_nonce(&self) -> u64 {
         last_nonce(self.bits)
     }
+}
+
+/// The transcript footprint of a proof-of-work step: how the nonce is written
+/// and absorbed, and how many check bytes are squeezed after it.
+///
+/// The NARG string carries the nonce through [`ToNarg`] and [`FromNarg`], and
+/// the duplex sponge absorbs its [`Encoding`]; the two may differ. The step
+/// itself enforces the range `nonce < 2^(bits + 7)`, and the
+/// [`Transcript`] verifier rejects a nonce that does not serialize back to the
+/// bytes it read, so [`FromNarg`] may accept non-canonical input.
+///
+/// An implementation must satisfy, for every nonce `n` below `2^(bits + 7)`:
+///
+/// - `Self::new(n).value() == n`;
+/// - [`Encoding::encode`] is injective and prefix-free, so distinct nonces
+///   leave distinct duplex sponge states and no two proofs share a transcript;
+/// - [`ToNarg::to_narg`] is injective, and [`FromNarg::from_narg`] parses its
+///   output back to the same nonce.
+///
+/// The codec is part of the proof format: fix it in the protocol and its
+/// session tag.
+pub trait PowCodec: ToNarg + FromNarg {
+    /// The nonce with value `nonce`.
+    fn new(nonce: u64) -> Self;
+
+    /// The value of this nonce.
+    fn value(&self) -> u64;
+
+    /// The number of bytes squeezed for the check at difficulty `bits`, from
+    /// `ceil(bits / 8)` to 8. The nonce is accepted iff the low `bits` bits of
+    /// these bytes, read little-endian, are zero.
+    fn check_len(bits: u32) -> usize;
+}
+
+/// The default nonce codec: the duplex sponge absorbs exactly the canonical
+/// LEB128 bytes that the NARG string carries, then `ceil(bits / 8)` check bytes
+/// are squeezed.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Leb128Nonce(pub u64);
+
+/// A nonce codec for word-aligned transcripts: the NARG string carries
+/// canonical LEB128, the duplex sponge absorbs one little-endian `u64` word,
+/// and 8 check bytes are squeezed. Whole-word absorbs and squeezes keep a
+/// transcript whose messages are multiples of 8 bytes aligned.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct WordNonce(pub u64);
+
+impl Encoding for Leb128Nonce {
+    fn encode(&self) -> impl AsRef<[u8]> {
+        Leb128::new(self.0)
+    }
+}
+
+impl ToNarg for Leb128Nonce {}
+
+impl FromNarg for Leb128Nonce {
+    fn from_narg(reader: &mut NargReader<'_>) -> Result<Self, VerificationError> {
+        read_leb128(reader).map(Self)
+    }
+}
+
+impl PowCodec for Leb128Nonce {
+    fn new(nonce: u64) -> Self {
+        Self(nonce)
+    }
+
+    fn value(&self) -> u64 {
+        self.0
+    }
+
+    fn check_len(bits: u32) -> usize {
+        word_len(bits)
+    }
+}
+
+impl Encoding for WordNonce {
+    fn encode(&self) -> impl AsRef<[u8]> {
+        self.0.to_le_bytes()
+    }
+}
+
+impl ToNarg for WordNonce {
+    fn to_narg(&self, narg: &mut Vec<u8>) {
+        narg.extend_from_slice(Leb128::new(self.0).as_bytes());
+    }
+}
+
+impl FromNarg for WordNonce {
+    fn from_narg(reader: &mut NargReader<'_>) -> Result<Self, VerificationError> {
+        read_leb128(reader).map(Self)
+    }
+}
+
+impl PowCodec for WordNonce {
+    fn new(nonce: u64) -> Self {
+        Self(nonce)
+    }
+
+    fn value(&self) -> u64 {
+        self.0
+    }
+
+    fn check_len(_bits: u32) -> usize {
+        8
+    }
+}
+
+/// Reads LEB128 up to the first byte without the high bit, rejecting a value
+/// above `u64::MAX`. Non-canonical input parses; the transcript rejects it
+/// because it does not serialize back to the bytes read.
+fn read_leb128(reader: &mut NargReader<'_>) -> Result<u64, VerificationError> {
+    let mut value = 0u64;
+    for shift in (0..64).step_by(7) {
+        let [byte] = reader.take_array::<1>()?;
+        let low = u64::from(byte & 0x7f);
+        if shift == 63 && low > 1 {
+            return Err(VerificationError);
+        }
+        value |= low << shift;
+        if byte & 0x80 == 0 {
+            return Ok(value);
+        }
+    }
+    Err(VerificationError)
 }
 
 /// The canonical LEB128 encoding of a `u64`.
@@ -330,6 +517,12 @@ impl Leb128 {
     }
 }
 
+impl AsRef<[u8]> for Leb128 {
+    fn as_ref(&self) -> &[u8] {
+        self.as_bytes()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::cell::RefCell;
@@ -340,7 +533,7 @@ mod tests {
         VerificationError, VerifierState, Witness,
     };
 
-    use super::PowTranscriptExt;
+    use super::{Leb128Nonce, PowCodec, PowTranscriptExt, WordNonce};
     // Use different public/private duplex sponges to exercise the refactored RNG bound.
     fn prover() -> ProverState<TurboShake128, Shake128> {
         let session_id = Narg::derive_session_id(b"pow/tests/v1");
@@ -438,17 +631,24 @@ mod tests {
             }
         }
 
-        let session_id = Narg::derive_session_id(b"pow/tests/non-associative");
-        let mut prover =
-            ProverState::<NonAssociativeSponge>::new_with_seed(&session_id, &0u32, [7; 32]);
-        // 9 bits use a two-byte check word.
-        assert!(prover.verifier_message_pow::<u64>(9).is_err());
-        #[cfg(feature = "parallel")]
-        {
-            let mut parallel =
+        fn rejects<N: PowCodec>(bits: u32) {
+            let session_id = Narg::derive_session_id(b"pow/tests/non-associative");
+            let mut prover =
                 ProverState::<NonAssociativeSponge>::new_with_seed(&session_id, &0u32, [7; 32]);
-            assert!(super::verifier_message_pow_parallel::<u64>(&mut parallel, 9).is_err());
+            assert!(prover.verifier_message_pow_with::<N, u64>(bits).is_err());
+            #[cfg(feature = "parallel")]
+            {
+                let mut parallel =
+                    ProverState::<NonAssociativeSponge>::new_with_seed(&session_id, &0u32, [7; 32]);
+                assert!(
+                    super::verifier_message_pow_parallel_with::<N, u64>(&mut parallel, bits)
+                        .is_err()
+                );
+            }
         }
+        // Both checks squeeze at least two bytes.
+        rejects::<Leb128Nonce>(9);
+        rejects::<WordNonce>(1);
     }
 
     #[test]
@@ -515,7 +715,25 @@ mod tests {
         }
     }
 
-    fn reference_round<H: DuplexSpongeInit<U = u8>>(
+    /// What each codec absorbs for `nonce`, and how many check bytes it
+    /// squeezes at `bits`, written independently of the implementation.
+    trait Reference: PowCodec {
+        fn reference(nonce: u64, bits: u32) -> (Vec<u8>, usize);
+    }
+
+    impl Reference for Leb128Nonce {
+        fn reference(nonce: u64, bits: u32) -> (Vec<u8>, usize) {
+            (reference_nonce(nonce), bits.div_ceil(8) as usize)
+        }
+    }
+
+    impl Reference for WordNonce {
+        fn reference(nonce: u64, _bits: u32) -> (Vec<u8>, usize) {
+            (nonce.to_le_bytes().to_vec(), 8)
+        }
+    }
+
+    fn reference_round<H: DuplexSpongeInit<U = u8>, N: Reference>(
         bits: u32,
         padding: usize,
         skipped: usize,
@@ -530,9 +748,10 @@ mod tests {
             (0..1u64 << (bits + 7))
                 .find_map(|nonce| {
                     let proof = reference_nonce(nonce);
+                    let (absorbed, check_len) = N::reference(nonce, bits);
                     let mut after = before.clone();
-                    after.absorb(&proof);
-                    let mut check = vec![0; bits.div_ceil(8) as usize];
+                    after.absorb(&absorbed);
+                    let mut check = vec![0; check_len];
                     after.squeeze(&mut check);
                     let passes =
                         (0..bits).all(|bit| check[bit as usize / 8] & (1 << (bit % 8)) == 0);
@@ -593,23 +812,84 @@ mod tests {
             ),
         ];
         for &vector in vectors {
-            assert_vector::<TurboShake128>(vector);
+            assert_vector::<TurboShake128, Leb128Nonce>(vector);
         }
+    }
+
+    #[test]
+    fn word_nonce_fixed_vectors_match_an_independent_manual_reference() {
+        // Without work no nonce is absorbed, so 0 bits match the default codec.
+        let vectors: &[Vector] = &[
+            (
+                0,
+                0,
+                0,
+                &[],
+                13_056_027_867_765_232_788,
+                12_177_758_299_268_758_940,
+            ),
+            (
+                1,
+                0,
+                0,
+                &[1],
+                15_691_680_197_904_407_217,
+                8_438_875_517_038_877_549,
+            ),
+            (
+                8,
+                0,
+                0,
+                &[232, 1],
+                15_654_716_054_109_558_801,
+                11_513_717_691_920_993_379,
+            ),
+            (
+                9,
+                164,
+                152,
+                &[123],
+                10_363_052_929_882_862_410,
+                2_905_093_286_157_497_597,
+            ),
+            (
+                14,
+                0,
+                0,
+                &[249, 167, 1],
+                8_609_936_258_586_369_514,
+                7_662_963_768_362_757_745,
+            ),
+        ];
+        for &vector in vectors {
+            assert_vector::<TurboShake128, WordNonce>(vector);
+        }
+        assert_vector::<spongefish::instantiations::Keccak, WordNonce>((
+            8,
+            132,
+            120,
+            &[134, 1],
+            12_131_203_392_289_587_386,
+            11_450_563_165_556_056_466,
+        ));
     }
 
     type Vector = (u32, usize, usize, &'static [u8], u64, u64);
 
-    fn assert_vector<H: DuplexSpongeInit<U = u8> + Send>(
+    fn assert_vector<H: DuplexSpongeInit<U = u8> + Send, N: Reference>(
         (bits, padding, skipped, proof, challenge, following): Vector,
     ) {
         let session = Narg::derive_session_id(b"pow/tests/vectors/v1");
-        let reference = reference_round::<H>(bits, padding, skipped);
+        let reference = reference_round::<H, N>(bits, padding, skipped);
         assert_eq!(reference, (proof.to_vec(), challenge, following));
         let mut prover = ProverState::<H, Shake128>::new_with_seed(&session, &0u32, [7; 32]);
         for _ in 0..padding {
             prover.public_message(&42u8);
         }
-        assert_eq!(prover.verifier_message_pow::<u64>(bits).unwrap(), challenge);
+        assert_eq!(
+            prover.verifier_message_pow_with::<N, u64>(bits).unwrap(),
+            challenge
+        );
         for _ in 0..skipped {
             let _ = prover.verifier_message::<u8>();
         }
@@ -620,7 +900,7 @@ mod tests {
             verifier.public_message(&42u8);
         }
         assert_eq!(
-            verifier.verifier_message_pow::<u64>(bits).unwrap(),
+            verifier.verifier_message_pow_with::<N, u64>(bits).unwrap(),
             challenge
         );
         for _ in 0..skipped {
@@ -641,7 +921,8 @@ mod tests {
                     parallel.public_message(&42u8);
                 }
                 assert_eq!(
-                    super::verifier_message_pow_parallel::<u64>(&mut parallel, bits).unwrap(),
+                    super::verifier_message_pow_parallel_with::<N, u64>(&mut parallel, bits)
+                        .unwrap(),
                     challenge
                 );
                 for _ in 0..skipped {
@@ -656,7 +937,7 @@ mod tests {
     #[test]
     fn permutation_duplex_fixed_vector_matches_manual_reference() {
         // The 136-byte overwrite-duplex rate is crossed on both sides.
-        assert_vector::<spongefish::instantiations::Keccak>((
+        assert_vector::<spongefish::instantiations::Keccak, Leb128Nonce>((
             8,
             132,
             120,
@@ -800,6 +1081,25 @@ mod tests {
 
     #[test]
     fn verifier_message_pow_accepts_only_canonical_nonces_in_range() {
+        // Both codecs carry the same NARG form.
+        fn decides<N: PowCodec>(accepted: &[(u64, u32, &[u8])], rejected: &[(u32, &[u8])]) {
+            for &(_, bits, proof) in accepted {
+                let mut verifier = recording_verifier(proof);
+                assert!(
+                    verifier.verifier_message_pow_with::<N, u64>(bits).is_ok(),
+                    "{proof:?}"
+                );
+                assert!(verifier.check_eof().is_ok());
+            }
+            for &(bits, proof) in rejected {
+                let mut verifier = recording_verifier(proof);
+                assert!(
+                    verifier.verifier_message_pow_with::<N, u64>(bits).is_err(),
+                    "{proof:?}"
+                );
+                assert!(verifier.check_eof().is_err());
+            }
+        }
         // The recording sponge squeezes zeros, so every nonce meets the
         // target and only the encoding decides.
         let accepted: &[(u64, u32, &[u8])] = &[
@@ -827,14 +1127,8 @@ mod tests {
                 &[0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 1],
             ),
         ];
-        for &(nonce, bits, proof) in accepted {
+        for &(nonce, _, proof) in accepted {
             assert_eq!(leb128(nonce), proof);
-            let mut verifier = recording_verifier(proof);
-            assert!(
-                verifier.verifier_message_pow::<u64>(bits).is_ok(),
-                "{proof:?}"
-            );
-            assert!(verifier.check_eof().is_ok());
         }
         // A trailing zero byte, a nonce of 2^8 at 1 bit, a continuation past
         // the longest encoding, 2^32 at 25 bits, and an overflowing u64 nonce.
@@ -855,14 +1149,8 @@ mod tests {
                 &[0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x02],
             ),
         ];
-        for &(bits, proof) in rejected {
-            let mut verifier = recording_verifier(proof);
-            assert!(
-                verifier.verifier_message_pow::<u64>(bits).is_err(),
-                "{proof:?}"
-            );
-            assert!(verifier.check_eof().is_err());
-        }
+        decides::<Leb128Nonce>(accepted, rejected);
+        decides::<WordNonce>(accepted, rejected);
     }
 
     #[test]
@@ -872,8 +1160,7 @@ mod tests {
         assert_eq!(
             events(),
             [
-                Event::Absorb(vec![0x85]),
-                Event::Absorb(vec![0x01]),
+                Event::Absorb(vec![0x85, 0x01]),
                 Event::Squeeze(1),
                 Event::Squeeze(1),
                 Event::Squeeze(8)
@@ -885,6 +1172,56 @@ mod tests {
         assert_eq!(verifier.verifier_message_pow::<u64>(0).unwrap(), 0);
         assert_eq!(events(), [Event::Squeeze(8)]);
         assert!(verifier.check_eof().is_ok());
+    }
+
+    #[test]
+    fn word_nonce_absorbs_a_u64_word_then_squeezes_eight_check_bytes() {
+        let mut verifier = recording_verifier(&[0x85, 0x01]);
+        assert_eq!(
+            verifier
+                .verifier_message_pow_with::<WordNonce, u64>(10)
+                .unwrap(),
+            0
+        );
+        let mut expected = vec![Event::Absorb(133u64.to_le_bytes().to_vec())];
+        expected.extend(std::iter::repeat_n(Event::Squeeze(1), 8));
+        expected.push(Event::Squeeze(8));
+        assert_eq!(events(), expected);
+        assert!(verifier.check_eof().is_ok());
+    }
+
+    #[test]
+    #[should_panic(expected = "PowCodec::check_len must be between ceil(bits / 8) and 8")]
+    fn a_codec_with_a_short_check_is_refused() {
+        #[derive(Clone, Copy)]
+        struct Short(u64);
+        impl spongefish::Encoding for Short {
+            fn encode(&self) -> impl AsRef<[u8]> {
+                self.0.to_le_bytes()
+            }
+        }
+        impl spongefish::ToNarg for Short {}
+        impl spongefish::FromNarg for Short {
+            fn from_narg(
+                reader: &mut spongefish::NargReader<'_>,
+            ) -> Result<Self, VerificationError> {
+                reader
+                    .take_array()
+                    .map(|bytes| Self(u64::from_le_bytes(bytes)))
+            }
+        }
+        impl PowCodec for Short {
+            fn new(nonce: u64) -> Self {
+                Self(nonce)
+            }
+            fn value(&self) -> u64 {
+                self.0
+            }
+            fn check_len(_bits: u32) -> usize {
+                1
+            }
+        }
+        let _ = prover().verifier_message_pow_with::<Short, u64>(9);
     }
 
     #[test]
@@ -929,11 +1266,37 @@ mod tests {
             assert_eq!(CALLS.with(Cell::get), expected_calls);
             verifier.check_eof().unwrap();
         }
+        // The word codec absorbs 8 bytes and squeezes 8, whatever the nonce.
+        for (padding, proof, challenge_len, expected_calls) in [
+            (4, &[0][..], 8, 1),       // instance, padding and word fill one block
+            (4, &[0][..], 9, 2),       // check + challenge crosses the output boundary
+            (5, &[0][..], 8, 2),       // the word crosses the absorb boundary
+            (12, &[0][..], 8, 2),      // the word starts after a full absorb block
+            (4, &[0x80, 1][..], 8, 1), // a longer NARG nonce costs nothing more
+        ] {
+            let mut verifier = VerifierState::<CountingDuplex>::new(&session, &0u32, proof);
+            for _ in 0..padding {
+                verifier.public_message(&0u8);
+            }
+            CALLS.with(|calls| calls.set(0));
+            if challenge_len == 8 {
+                verifier
+                    .verifier_message_pow_with::<WordNonce, [u8; 8]>(1)
+                    .unwrap();
+            } else {
+                verifier
+                    .verifier_message_pow_with::<WordNonce, [u8; 9]>(1)
+                    .unwrap();
+            }
+            assert_eq!(CALLS.with(Cell::get), expected_calls);
+            verifier.check_eof().unwrap();
+        }
     }
 
     #[test]
     fn verifier_message_pow_layout() {
-        use super::{accepts, last_nonce, max_nonce_len, word_len, Leb128};
+        use super::{accepts, last_nonce, word_len, Leb128};
+        let max_nonce_len = |bits| (bits as usize + 13) / 7;
         let layout = |bits| (last_nonce(bits), max_nonce_len(bits), word_len(bits));
         assert_eq!(layout(1), (255, 2, 1));
         assert_eq!(layout(8), ((1 << 15) - 1, 3, 1));
@@ -957,17 +1320,17 @@ mod tests {
 
     #[test]
     fn verifier_message_pow_search_finds_a_lone_nonce_anywhere_in_the_space() {
-        use super::{last_nonce, TranscriptPoW};
-        use crate::PoWGrinder;
-        for bits in [1] {
-            let last = last_nonce(bits);
-            for target in [None, Some(127), Some(128), Some(last)] {
+        fn finds<N: Reference>() {
+            use super::{last_nonce, TranscriptPoW};
+            use crate::PoWGrinder;
+            let bits = 1;
+            for target in [None, Some(127), Some(128), Some(last_nonce(bits))] {
                 let evaluate = |candidate: &[u8], out: &mut [u8]| {
-                    let hit = target.is_some_and(|nonce| candidate == reference_nonce(nonce));
+                    let hit = target.is_some_and(|nonce| candidate == N::reference(nonce, bits).0);
                     out.fill(if hit { 0 } else { 0xff });
                 };
                 assert_eq!(
-                    PoWGrinder::new(TranscriptPoW::new(evaluate, bits)).grind(),
+                    PoWGrinder::new(TranscriptPoW::<_, N>::new(evaluate, bits)).grind(),
                     target
                 );
                 #[cfg(feature = "parallel")]
@@ -977,14 +1340,17 @@ mod tests {
                         .build()
                         .unwrap();
                     assert_eq!(
-                        pool.install(
-                            || PoWGrinder::new(TranscriptPoW::new(evaluate, bits)).grind_parallel()
-                        ),
+                        pool.install(|| {
+                            PoWGrinder::new(TranscriptPoW::<_, N>::new(evaluate, bits))
+                                .grind_parallel()
+                        }),
                         target
                     );
                 }
             }
         }
+        finds::<Leb128Nonce>();
+        finds::<WordNonce>();
     }
 
     #[test]
@@ -996,14 +1362,18 @@ mod tests {
     #[test]
     fn every_truncated_nonce_is_rejected() {
         // The largest nonce is valid at 57 bits; every proper prefix is incomplete.
-        let proof = leb128(u64::MAX);
-        for length in 0..proof.len() {
-            let mut verifier = recording_verifier(&proof[..length]);
-            assert!(verifier.verifier_message_pow::<u64>(57).is_err());
-            assert!(!events()
-                .iter()
-                .any(|event| matches!(event, Event::Squeeze(_))));
-            assert!(verifier.check_eof().is_err());
+        fn truncated<N: PowCodec>() {
+            let proof = leb128(u64::MAX);
+            for length in 0..proof.len() {
+                let mut verifier = recording_verifier(&proof[..length]);
+                assert!(verifier.verifier_message_pow_with::<N, u64>(57).is_err());
+                assert!(!events()
+                    .iter()
+                    .any(|event| matches!(event, Event::Squeeze(_))));
+                assert!(verifier.check_eof().is_err());
+            }
         }
+        truncated::<Leb128Nonce>();
+        truncated::<WordNonce>();
     }
 }

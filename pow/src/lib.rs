@@ -14,8 +14,8 @@ pub mod keccak;
 mod protocol;
 
 #[cfg(feature = "parallel")]
-pub use protocol::verifier_message_pow_parallel;
-pub use protocol::PowTranscriptExt;
+pub use protocol::{verifier_message_pow_parallel, verifier_message_pow_parallel_with};
+pub use protocol::{Leb128Nonce, PowCodec, PowTranscriptExt, WordNonce};
 
 /// Search a prepared proof-of-work strategy for its least accepted nonce.
 ///
