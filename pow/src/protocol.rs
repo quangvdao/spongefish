@@ -107,7 +107,13 @@ pub trait PowTranscriptExt: Transcript {
     /// The prover returns [`VerificationError`] if the search exhausts the
     /// nonce space, or if the [`Transcript`] implementation does not support
     /// [`Transcript::search_verifier_message`] and rejects the resulting unknown prover
-    /// message, as [`ProverState`](spongefish::ProverState) does. For
+    /// message, as [`ProverState`](spongefish::ProverState) does. The prover
+    /// also replays the check on its own transcript, in release builds too,
+    /// and returns the error if the replay rejects the nonce it found. This
+    /// happens only with a duplex sponge whose absorb and squeeze are not
+    /// associative, as [`DuplexSpongeInterface`](spongefish::DuplexSpongeInterface)
+    /// requires; the prover then reports an error instead of writing an
+    /// invalid proof. For
     /// `bits > 0`, the verifier returns it if the nonce is not canonical,
     /// exceeds the nonce space or misses the target, or if the proof is
     /// truncated. At any difficulty, an earlier failed read or check also
@@ -205,7 +211,15 @@ fn finish_pow<T: FromUniform>(
     for byte in &mut word[..word_len(bits)] {
         *byte = transcript.verifier_message();
     }
-    transcript.check(|| accepts(bits, word))?;
+    let accepted = accepts(bits, word);
+    // `ProverState::check` skips its predicate in release builds. The prover
+    // re-checks the replayed word anyway (one comparison), so a duplex sponge
+    // whose byte-at-a-time absorb and squeeze disagree with the one-shot search
+    // evaluator yields an error instead of a proof the verifier rejects.
+    if nonce.map(|_| accepted).into_known() == Some(false) {
+        return Err(VerificationError);
+    }
+    transcript.check(|| accepted)?;
     Ok(transcript.verifier_message())
 }
 
@@ -369,6 +383,47 @@ mod tests {
                 ProverState::<RecordingSponge<255>>::new_with_seed(&session_id, &0u32, [7; 32]);
             assert!(super::verifier_message_pow_parallel::<u64>(&mut parallel, 1).is_err());
             assert_eq!(parallel.into_narg_string(), b"");
+        }
+    }
+
+    #[test]
+    fn prover_rejects_a_nonce_its_own_replay_rejects() {
+        // Squeezes of one byte return 0xff, longer squeezes return zeros. The
+        // one-shot search evaluator squeezes the whole check word and accepts
+        // the first nonce; the byte-at-a-time replay rejects it. This violates
+        // the associativity that `DuplexSpongeInterface` requires.
+        #[derive(Clone)]
+        struct NonAssociativeSponge;
+
+        impl DuplexSpongeInterface for NonAssociativeSponge {
+            type U = u8;
+
+            fn absorb(&mut self, _input: &[u8]) -> &mut Self {
+                self
+            }
+
+            fn squeeze(&mut self, output: &mut [u8]) -> &mut Self {
+                output.fill(if output.len() == 1 { 0xff } else { 0 });
+                self
+            }
+        }
+
+        impl DuplexSpongeInit for NonAssociativeSponge {
+            fn init(_session_id: &[u8; 32]) -> Self {
+                Self
+            }
+        }
+
+        let session_id = Narg::derive_session_id(b"pow/tests/non-associative");
+        let mut prover =
+            ProverState::<NonAssociativeSponge>::new_with_seed(&session_id, &0u32, [7; 32]);
+        // 9 bits use a two-byte check word.
+        assert!(prover.verifier_message_pow::<u64>(9).is_err());
+        #[cfg(feature = "parallel")]
+        {
+            let mut parallel =
+                ProverState::<NonAssociativeSponge>::new_with_seed(&session_id, &0u32, [7; 32]);
+            assert!(super::verifier_message_pow_parallel::<u64>(&mut parallel, 9).is_err());
         }
     }
 
