@@ -362,13 +362,13 @@ mod tests {
         let mut prover =
             ProverState::<RecordingSponge<255>>::new_with_seed(&session_id, &0u32, [7; 32]);
         assert!(prover.verifier_message_pow::<u64>(1).is_err());
-        assert!(prover.into_narg_string().is_empty());
+        assert_eq!(prover.into_narg_string(), b"");
         #[cfg(feature = "parallel")]
         {
             let mut parallel =
                 ProverState::<RecordingSponge<255>>::new_with_seed(&session_id, &0u32, [7; 32]);
             assert!(super::verifier_message_pow_parallel::<u64>(&mut parallel, 1).is_err());
-            assert!(parallel.into_narg_string().is_empty());
+            assert_eq!(parallel.into_narg_string(), b"");
         }
     }
 

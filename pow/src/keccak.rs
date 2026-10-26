@@ -48,8 +48,8 @@ mod tests {
 
     fn reference_word(seed: [u8; 32], nonce: u64) -> u64 {
         let mut state = [0u64; 25];
-        for (word, bytes) in state.iter_mut().zip(seed.chunks_exact(8)) {
-            *word = u64::from_le_bytes(bytes.try_into().unwrap());
+        for (word, bytes) in state.iter_mut().zip(seed.as_chunks::<8>().0) {
+            *word = u64::from_le_bytes(*bytes);
         }
         state[4] = nonce;
         Keccak::new().with_f1600(|permute| permute(&mut state));
